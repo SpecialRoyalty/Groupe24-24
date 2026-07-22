@@ -87,3 +87,7 @@ Le panneau administrateur permet maintenant de configurer :
 - l'envoi manuel de la publicité à tous les groupes PUB actifs.
 
 Lorsqu'il est ajouté à un groupe, le bot n'envoie aucun message dans ce groupe. Il enregistre le groupe et adresse la demande de configuration uniquement en message privé aux identifiants présents dans `ADMIN_IDS`. Chaque administrateur doit avoir démarré le bot en privé au moins une fois pour recevoir ce message.
+
+## Modération configurable
+
+Le menu **🛡 Modération** permet de gérer depuis Telegram les mots interdits, l’anti-liens, les listes blanches, les sanctions, l’anti-repost SHA256/pHash, les messages système et les statistiques. Les tables correspondantes sont créées automatiquement dans PostgreSQL au démarrage.
