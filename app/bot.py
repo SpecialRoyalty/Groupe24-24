@@ -346,9 +346,9 @@ async def payment_choice(c: CallbackQuery):
     extra = ""
     if method == "paypal":
         extra = (
-            "\n\n<b>Important PayPal :</b> utilisez le type de paiement conforme proposé par PayPal pour cette transaction. "
-            "Ne classez pas volontairement un achat d’accès comme un envoi personnel afin de contourner les frais ou protections. "
-            "Un paiement non conforme pourra être refusé et transmis aux administrateurs pour examen."
+            "\n\n<b>Important PayPal :</b> seuls les paiements de type <b>« Entre proches »</b> sont acceptés. "
+            "Les paiements de type <b>« Biens et services »</b> (marchand) seront refusés. "
+            "En cas de non-respect de cette règle, votre accès pourra être refusé et vous serez banni."
         )
     safe_details = escape(details or "Non configuré")
     raw_details = (details or "").strip()
