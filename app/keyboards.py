@@ -34,6 +34,7 @@ def admin_home(options_enabled: bool, group_open: bool):
         ("📣 Configurer la publicité PUB", "admin:pub_ad"),
         ("🚀 Envoyer la publicité PUB", "admin:pub_send"),
         ("📢 Broadcast utilisateurs", "admin:broadcast"),
+        ("🛡 Modération", "mod:home"),
         ("📊 Statistiques", "admin:stats"),
         ("👥 Groupes détectés", "admin:groups"),
         ("🩺 Santé du système", "admin:health"),

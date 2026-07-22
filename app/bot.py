@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import logging
 from html import escape
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -13,8 +14,9 @@ from sqlalchemy import select, func, text
 from .config import get_settings
 from .db import SessionLocal
 from .keyboards import access_methods, admin_home, kb, payment_details_keyboard, payment_keyboard, rules_keyboard
-from .models import AccessMethod, AccessRequest, AccessStatus, ActivityMedia, Invite, MediaSubmission, Membership, PaymentProof, Referral, TelegramChat, User
+from .models import AccessMethod, AccessRequest, AccessStatus, ActivityMedia, Invite, MediaSubmission, Membership, PaymentProof, Referral, TelegramChat, User, ForbiddenWord, LinkWhitelistDomain, LinkWhitelistUser, MediaHash, ModerationStat
 from .services import active_request, activity_count, create_personal_invite, create_request, get_or_create_user, get_setting, pub_chat, set_group_open, set_setting, validated_referrals, vip_chat
+from .moderation import apply_sanction, forbidden_word_hit, links_blocked, process_repost, safe_delete, stat_inc
 
 settings = get_settings()
 bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -25,6 +27,7 @@ LAST_MAINTENANCE_AT: datetime | None = None
 LAST_MAINTENANCE_ERROR: str | None = None
 LAST_HEALTH_SIGNATURE: str | None = None
 ADMIN_INPUT_MODE: dict[int, str] = {}
+logger = logging.getLogger("telegram-vip-bot")
 
 DEFAULT_WELCOME_TEXT = "Bienvenue sur le service d’accès au groupe privé ouvert 24 h/24.\n\nVeuillez d’abord consulter les règles."
 DEFAULT_PUB_AD_TEXT = "Découvrez notre groupe privé. Utilisez le bouton ci-dessous pour commencer votre demande d’accès."
@@ -33,25 +36,41 @@ RULES = """<b>Règles du groupe VIP</b>\n\n• Premier média dans les 24 heures
 
 ADMIN_STATUSES = {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
-async def edit_message(message: Message, text_value: str, **kwargs):
-    """Modifie un message texte ou la légende d’un média sans provoquer d’erreur Telegram."""
+async def edit_or_send(message: Message, text_value: str, **kwargs):
+    """Édite texte/légende quand possible, sinon envoie un nouveau message sans planter."""
     try:
+        if message.photo or message.video or message.animation or message.document or message.caption is not None:
+            return await message.edit_caption(caption=text_value, **kwargs)
         if message.text is not None:
             return await message.edit_text(text_value, **kwargs)
-        if message.caption is not None or message.photo or message.video or message.animation or message.document:
-            return await message.edit_caption(caption=text_value, **kwargs)
         return await message.answer(text_value, **kwargs)
     except TelegramBadRequest as exc:
         error = str(exc).lower()
+        handled = (
+            "message can't be edited",
+            "message is not modified",
+            "there is no text in the message",
+            "message to edit not found",
+        )
+        logger.warning("Erreur Telegram édition: %s", exc)
         if "message is not modified" in error:
             return message
-        if "there is no text in the message to edit" in error:
-            try:
-                return await message.edit_caption(caption=text_value, **kwargs)
-            except TelegramBadRequest:
-                return await message.answer(text_value, **kwargs)
-        raise
+        if any(item in error for item in handled):
+            return await message.answer(text_value, **kwargs)
+        try:
+            return await message.answer(text_value, **kwargs)
+        except Exception:
+            logger.exception("Erreur Telegram lors du fallback answer")
+            return message
+    except Exception:
+        logger.exception("Erreur Telegram edit_or_send")
+        try:
+            return await message.answer(text_value, **kwargs)
+        except Exception:
+            logger.exception("Erreur Telegram answer finale")
+            return message
 
+edit_message = edit_or_send
 
 async def paid_access_state(session, user_id: int):
     """Retourne la dernière demande payée validée et indique si son lien a déjà été utilisé."""
@@ -236,6 +255,7 @@ async def start(message: Message):
     if message.chat.type != "private": return
     async with SessionLocal() as s:
         user = await get_or_create_user(s, message.from_user)
+        logger.info("Nouvelle connexion user=%s username=%s", message.from_user.id, message.from_user.username)
         paid_req, link_used = await paid_access_state(s, user.id)
     if paid_req:
         await show_existing_paid_access(message, paid_req, link_used)
@@ -332,8 +352,14 @@ async def payment_choice(c: CallbackQuery):
             "Un paiement non conforme pourra être refusé et transmis aux administrateurs pour examen."
         )
     safe_details = escape(details or "Non configuré")
-    if details and details.lower().startswith(("https://", "http://")):
+    raw_details = (details or "").strip()
+    if raw_details.lower().startswith(("https://", "http://")):
         destination = f'<a href="{safe_details}">{safe_details}</a>'
+    elif "@" in raw_details and "." in raw_details.split("@")[-1]:
+        destination = f'<a href="mailto:{safe_details}">{safe_details}</a>'
+    elif raw_details.startswith("@"):
+        username = escape(raw_details[1:])
+        destination = f'<a href="https://t.me/{username}">{safe_details}</a>'
     else:
         destination = f"<code>{safe_details}</code>"
 
@@ -362,6 +388,7 @@ async def private_photo(message: Message):
         user = await get_or_create_user(s, message.from_user); req = await active_request(s, user.id)
         if not req: return
         if req.method == AccessMethod.payment.value:
+            logger.info("Paiement reçu user=%s request=%s", message.from_user.id, req.id)
             proof = PaymentProof(request_id=req.id, file_id=message.photo[-1].file_id, payment_method="manual")
             req.status = AccessStatus.pending_review.value; s.add(proof); await s.commit()
             cap = f"Paiement à vérifier\nUtilisateur : {message.from_user.full_name} (@{message.from_user.username or '-'})\nID : <code>{message.from_user.id}</code>\nRéférence : <code>{req.reference}</code>"
@@ -466,14 +493,23 @@ async def paid_already_used(c: CallbackQuery):
 @r.message(F.new_chat_members)
 async def delete_join_service_message(message: Message):
     """Supprime les messages système d’entrée/acceptation dans les groupes."""
-    with suppress(Exception):
-        await message.delete()
+    async with SessionLocal() as s:
+        enabled = (await get_setting(s, "delete_system_messages", "1")) == "1"
+    if enabled:
+        await safe_delete(message)
 
 @r.message(F.left_chat_member)
 async def delete_leave_service_message(message: Message):
     """Supprime les messages système de sortie dans les groupes."""
     with suppress(Exception):
         await message.delete()
+
+@r.message(F.pinned_message | F.new_chat_title | F.new_chat_photo | F.delete_chat_photo | F.group_chat_created | F.supergroup_chat_created | F.channel_chat_created | F.message_auto_delete_timer_changed)
+async def delete_other_service_messages(message: Message):
+    async with SessionLocal() as s:
+        enabled = (await get_setting(s, "delete_system_messages", "1")) == "1"
+    if enabled:
+        await safe_delete(message)
 
 @r.chat_member()
 async def member_update(event: ChatMemberUpdated):
@@ -650,21 +686,47 @@ async def status(message: Message):
 
 @r.message(F.chat.type.in_({"group","supergroup"}))
 async def group_messages(message: Message):
-    if not message.from_user or message.from_user.is_bot: return
-    async with SessionLocal() as s:
-        chat=await s.scalar(select(TelegramChat).where(TelegramChat.telegram_chat_id==message.chat.id))
-        if not chat or chat.role!="vip": return
-        user=await get_or_create_user(s,message.from_user)
-        m=await s.scalar(select(Membership).where(Membership.user_id==user.id,Membership.chat_id==chat.id,Membership.active.is_(True)))
-        if not m: return
-        if message.photo or message.video:
-            if not m.first_media_at: m.first_media_at=datetime.now(timezone.utc)
-            s.add(ActivityMedia(membership_id=m.id,message_id=message.message_id,media_type="photo" if message.photo else "video")); await s.commit()
-        entities=(message.entities or [])+(message.caption_entities or [])
-        has_link=any(e.type in {"url","text_link"} for e in entities)
-        if has_link and not await is_admin(message.from_user.id):
-            try: await message.delete(); await bot.ban_chat_member(message.chat.id,message.from_user.id); await bot.send_message(message.from_user.id,"Vous avez été banni pour envoi d’un lien interdit.")
-            except Exception: pass
+    if not message.from_user or message.from_user.is_bot:
+        return
+    try:
+        async with SessionLocal() as s:
+            chat = await s.scalar(select(TelegramChat).where(TelegramChat.telegram_chat_id == message.chat.id))
+            if not chat or chat.role != "vip":
+                return
+            sender_admin = await is_admin(message.from_user.id, message.chat.id)
+            text_value = message.text or message.caption or ""
+
+            hit = await forbidden_word_hit(s, text_value)
+            if hit and not sender_admin:
+                await safe_delete(message)
+                await stat_inc(s, "forbidden_words_blocked")
+                sanction = await get_setting(s, "forbidden_words_sanction", "warning")
+                await s.commit()
+                await apply_sanction(bot, message, sanction, "mot interdit")
+                logger.info("Mot interdit chat=%s user=%s word=%s", message.chat.id, message.from_user.id, hit)
+                return
+
+            if await links_blocked(s, message, sender_admin):
+                await safe_delete(message)
+                await stat_inc(s, "links_blocked")
+                sanction = await get_setting(s, "anti_links_sanction", "warning")
+                await s.commit()
+                await apply_sanction(bot, message, sanction, "lien interdit")
+                logger.info("Lien bloqué chat=%s user=%s", message.chat.id, message.from_user.id)
+                return
+
+            if (message.photo or message.video) and await process_repost(bot, s, message):
+                return
+
+            user = await get_or_create_user(s, message.from_user)
+            membership = await s.scalar(select(Membership).where(Membership.user_id == user.id, Membership.chat_id == chat.id, Membership.active.is_(True)))
+            if membership and (message.photo or message.video):
+                if not membership.first_media_at:
+                    membership.first_media_at = datetime.now(timezone.utc)
+                s.add(ActivityMedia(membership_id=membership.id, message_id=message.message_id, media_type="photo" if message.photo else "video"))
+                await s.commit()
+    except Exception:
+        logger.exception("Erreur modération message chat=%s", message.chat.id)
 
 async def maintenance_loop():
     global LAST_MAINTENANCE_AT, LAST_MAINTENANCE_ERROR
@@ -920,6 +982,141 @@ async def broadcast_start(c: CallbackQuery):
 async def broadcast_cancel_button(c: CallbackQuery):
     BROADCAST_WAITING.discard(c.from_user.id); await render_admin_panel(c.message, edit=True); await c.answer("Annulé")
 
+
+async def moderation_home_screen(message: Message):
+    async with SessionLocal() as s:
+        fw = (await get_setting(s, "forbidden_words_enabled", "0")) == "1"
+        al = (await get_setting(s, "anti_links_enabled", "0")) == "1"
+        ar = (await get_setting(s, "anti_repost_enabled", "0")) == "1"
+        sysmsg = (await get_setting(s, "delete_system_messages", "1")) == "1"
+    await edit_or_send(message, "<b>🛡 Modération</b>\n\nToutes les protections sont stockées en PostgreSQL et configurables ici.", reply_markup=kb([
+        (f"🚫 Mots interdits — {'ON' if fw else 'OFF'}", "mod:words"),
+        (f"🔗 Anti-liens — {'ON' if al else 'OFF'}", "mod:links"),
+        (f"♻️ Anti-repost — {'ON' if ar else 'OFF'}", "mod:repost"),
+        (f"🧹 Messages système — {'ON' if sysmsg else 'OFF'}", "mod:system"),
+        ("⚠️ Sanctions", "mod:sanctions"),
+        ("📊 Statistiques", "mod:stats"),
+        ("⬅ Retour", "admin:home"), ("🏠 Menu", "menu")
+    ]))
+
+@r.callback_query(F.data == "mod:home")
+async def moderation_home(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    await moderation_home_screen(c.message); await c.answer()
+
+@r.callback_query(F.data == "mod:words")
+async def moderation_words(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    async with SessionLocal() as s:
+        enabled=(await get_setting(s,"forbidden_words_enabled","0"))=="1"
+        sanction=await get_setting(s,"forbidden_words_sanction","warning")
+        words=list((await s.scalars(select(ForbiddenWord).order_by(ForbiddenWord.word))).all())
+    listing="\n".join(f"• {escape(w.word)} {'✅' if w.active else '⏸'}" for w in words[:50]) or "Aucun mot enregistré."
+    await edit_or_send(c.message, f"<b>🚫 Mots interdits</b>\n\nÉtat : <b>{'ON' if enabled else 'OFF'}</b>\nSanction : <b>{sanction}</b>\n\n{listing}", reply_markup=kb([
+        ("Désactiver" if enabled else "Activer", "mod:words:toggle"), ("➕ Ajouter", "mod:words:add"), ("➖ Supprimer", "mod:words:remove"), ("⚠️ Changer sanction", "mod:words:sanction"), ("⬅ Retour", "mod:home"), ("🏠 Menu", "menu")]))
+    await c.answer()
+
+@r.callback_query(F.data == "mod:words:toggle")
+async def moderation_words_toggle(c: CallbackQuery):
+    async with SessionLocal() as s:
+        cur=(await get_setting(s,"forbidden_words_enabled","0"))=="1"; await set_setting(s,"forbidden_words_enabled","0" if cur else "1")
+    await moderation_words(c)
+
+@r.callback_query(F.data.in_({"mod:words:add","mod:words:remove"}))
+async def moderation_words_input(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    ADMIN_INPUT_MODE[c.from_user.id]="forbidden_add" if c.data.endswith("add") else "forbidden_remove"
+    await edit_or_send(c.message,"Envoyez le mot ou l’expression. Envoyez /annuler pour quitter.",reply_markup=kb([("⬅ Retour","mod:words"),("🏠 Menu","menu")]))
+    await c.answer()
+
+@r.callback_query(F.data == "mod:words:sanction")
+async def words_sanction(c: CallbackQuery):
+    await edit_or_send(c.message,"Choisissez la sanction appliquée aux mots interdits.",reply_markup=kb([(x.title(),f"mod:set:forbidden_words_sanction:{x}") for x in ["delete","warning","mute","kick","ban"]]+[("⬅ Retour","mod:words")]))
+    await c.answer()
+
+@r.callback_query(F.data == "mod:links")
+async def moderation_links(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    async with SessionLocal() as s:
+        vals={k:(await get_setting(s,k,d))=="1" for k,d in [("anti_links_enabled","0"),("anti_links_allow_telegram","0"),("anti_links_allow_tme","0"),("anti_links_allow_http","0"),("anti_links_allow_https","0"),("anti_links_allow_admins","1")]}
+        sanction=await get_setting(s,"anti_links_sanction","warning")
+        domains=list((await s.scalars(select(LinkWhitelistDomain).order_by(LinkWhitelistDomain.domain))).all())
+        users=list((await s.scalars(select(LinkWhitelistUser).order_by(LinkWhitelistUser.telegram_id))).all())
+    info=f"<b>🔗 Anti-liens</b>\n\nSanction : <b>{sanction}</b>\nDomaines whitelist : <b>{len(domains)}</b>\nUtilisateurs whitelist : <b>{len(users)}</b>"
+    rows=[(f"Protection {'ON' if vals['anti_links_enabled'] else 'OFF'}","mod:linktoggle:anti_links_enabled"),(f"Telegram {'✅' if vals['anti_links_allow_telegram'] else '❌'}","mod:linktoggle:anti_links_allow_telegram"),(f"t.me {'✅' if vals['anti_links_allow_tme'] else '❌'}","mod:linktoggle:anti_links_allow_tme"),(f"HTTP {'✅' if vals['anti_links_allow_http'] else '❌'}","mod:linktoggle:anti_links_allow_http"),(f"HTTPS {'✅' if vals['anti_links_allow_https'] else '❌'}","mod:linktoggle:anti_links_allow_https"),(f"Admins {'✅' if vals['anti_links_allow_admins'] else '❌'}","mod:linktoggle:anti_links_allow_admins"),("➕ Domaine whitelist","mod:domain:add"),("➖ Domaine whitelist","mod:domain:remove"),("➕ Utilisateur whitelist","mod:user:add"),("➖ Utilisateur whitelist","mod:user:remove"),("⚠️ Sanction","mod:links:sanction"),("⬅ Retour","mod:home"),("🏠 Menu","menu")]
+    await edit_or_send(c.message,info,reply_markup=kb(rows)); await c.answer()
+
+@r.callback_query(F.data.startswith("mod:linktoggle:"))
+async def link_toggle(c: CallbackQuery):
+    key=c.data.rsplit(":",1)[1]
+    async with SessionLocal() as s:
+        cur=(await get_setting(s,key,"0"))=="1"; await set_setting(s,key,"0" if cur else "1")
+    await moderation_links(c)
+
+@r.callback_query(F.data.in_({"mod:domain:add","mod:domain:remove","mod:user:add","mod:user:remove"}))
+async def whitelist_input(c: CallbackQuery):
+    ADMIN_INPUT_MODE[c.from_user.id]=c.data.replace("mod:","").replace(":","_")
+    await edit_or_send(c.message,"Envoyez la valeur à ajouter ou supprimer. Pour un utilisateur, envoyez son ID Telegram numérique.",reply_markup=kb([("⬅ Retour","mod:links")]))
+    await c.answer()
+
+@r.callback_query(F.data == "mod:links:sanction")
+async def links_sanction(c: CallbackQuery):
+    await edit_or_send(c.message,"Choisissez la sanction anti-liens.",reply_markup=kb([(x.title(),f"mod:set:anti_links_sanction:{x}") for x in ["delete","warning","mute","kick","ban"]]+[("⬅ Retour","mod:links")]))
+    await c.answer()
+
+@r.callback_query(F.data.startswith("mod:set:"))
+async def set_moderation_value(c: CallbackQuery):
+    _,_,key,value=c.data.split(":",3)
+    async with SessionLocal() as s: await set_setting(s,key,value)
+    await (moderation_words(c) if key.startswith("forbidden") else moderation_links(c))
+
+@r.callback_query(F.data == "mod:repost")
+async def moderation_repost(c: CallbackQuery):
+    async with SessionLocal() as s:
+        enabled=(await get_setting(s,"anti_repost_enabled","0"))=="1"; auto=(await get_setting(s,"anti_repost_auto_delete","1"))=="1"
+        count=int(await s.scalar(select(func.count(MediaHash.id))) or 0); dup=int((await s.get(ModerationStat,"reposts_detected")).value if await s.get(ModerationStat,"reposts_detected") else 0)
+    await edit_or_send(c.message,f"<b>♻️ Anti-repost</b>\n\nÉtat : <b>{'ON' if enabled else 'OFF'}</b>\nSuppression automatique : <b>{'ON' if auto else 'OFF'}</b>\nHash enregistrés : <b>{count}</b>\nDoublons détectés : <b>{dup}</b>",reply_markup=kb([("Désactiver" if enabled else "Activer","mod:repost:toggle"),("Suppression auto ON/OFF","mod:repost:delete"),("✏️ Modifier le message","mod:repost:message"),("🗑 Vider les hash","mod:repost:clear"),("⬅ Retour","mod:home"),("🏠 Menu","menu")]))
+    await c.answer()
+
+@r.callback_query(F.data.in_({"mod:repost:toggle","mod:repost:delete"}))
+async def repost_toggle(c: CallbackQuery):
+    key="anti_repost_enabled" if c.data.endswith("toggle") else "anti_repost_auto_delete"
+    async with SessionLocal() as s:
+        cur=(await get_setting(s,key,"0"))=="1"; await set_setting(s,key,"0" if cur else "1")
+    await moderation_repost(c)
+
+@r.callback_query(F.data == "mod:repost:message")
+async def repost_message_input(c: CallbackQuery):
+    ADMIN_INPUT_MODE[c.from_user.id]="anti_repost_message"
+    await edit_or_send(c.message,"Envoyez le nouveau message. Utilisez {user} pour la mention.",reply_markup=kb([("⬅ Retour","mod:repost")]))
+    await c.answer()
+
+@r.callback_query(F.data == "mod:repost:clear")
+async def repost_clear(c: CallbackQuery):
+    async with SessionLocal() as s:
+        await s.execute(__import__('sqlalchemy').delete(MediaHash)); await s.commit()
+    await moderation_repost(c)
+
+@r.callback_query(F.data == "mod:system")
+async def system_toggle(c: CallbackQuery):
+    async with SessionLocal() as s:
+        cur=(await get_setting(s,"delete_system_messages","1"))=="1"; await set_setting(s,"delete_system_messages","0" if cur else "1")
+    await c.answer("Réglage modifié",show_alert=True); await moderation_home_screen(c.message)
+
+@r.callback_query(F.data == "mod:sanctions")
+async def sanctions_screen(c: CallbackQuery):
+    async with SessionLocal() as s:
+        fw=await get_setting(s,"forbidden_words_sanction","warning"); links=await get_setting(s,"anti_links_sanction","warning")
+    await edit_or_send(c.message,f"<b>⚠️ Sanctions</b>\n\nMots interdits : <b>{fw}</b>\nAnti-liens : <b>{links}</b>\n\nMute : 1 heure.",reply_markup=kb([("🚫 Mots interdits","mod:words:sanction"),("🔗 Anti-liens","mod:links:sanction"),("⬅ Retour","mod:home")]))
+    await c.answer()
+
+@r.callback_query(F.data == "mod:stats")
+async def moderation_stats(c: CallbackQuery):
+    async with SessionLocal() as s:
+        stats={x.key:x.value for x in (await s.scalars(select(ModerationStat))).all()}; hashes=int(await s.scalar(select(func.count(MediaHash.id))) or 0)
+    await edit_or_send(c.message,f"<b>📊 Statistiques modération</b>\n\nMots bloqués : <b>{stats.get('forbidden_words_blocked',0)}</b>\nLiens bloqués : <b>{stats.get('links_blocked',0)}</b>\nDoublons détectés : <b>{stats.get('reposts_detected',0)}</b>\nHash médias : <b>{hashes}</b>",reply_markup=kb([("🔄 Actualiser","mod:stats"),("⬅ Retour","mod:home"),("🏠 Menu","menu")]))
+    await c.answer()
+
 @r.message(F.chat.type == "private", F.text)
 async def broadcast_text(message: Message):
     mode = ADMIN_INPUT_MODE.get(message.from_user.id)
@@ -928,11 +1125,39 @@ async def broadcast_text(message: Message):
             ADMIN_INPUT_MODE.pop(message.from_user.id, None)
             await message.answer("Configuration annulée.", reply_markup=kb([("⚙️ Panneau administrateur", "admin:home")]))
             return
-        if mode in {"welcome_text", "pub_text"}:
-            key = "welcome_text" if mode == "welcome_text" else "pub_ad_text"
+        if mode in {"welcome_text", "pub_text", "anti_repost_message"}:
+            key = {"welcome_text": "welcome_text", "pub_text": "pub_ad_text", "anti_repost_message": "anti_repost_message"}[mode]
             async with SessionLocal() as s: await set_setting(s, key, message.text)
             ADMIN_INPUT_MODE.pop(message.from_user.id, None)
-            await message.answer("✅ Texte enregistré.", reply_markup=kb([("⚙️ Panneau administrateur", "admin:home")]))
+            await message.answer("✅ Texte enregistré.", reply_markup=kb([("⬅ Retour", "mod:repost" if mode == "anti_repost_message" else "admin:home"), ("🏠 Menu", "menu")]))
+            return
+        if mode in {"forbidden_add", "forbidden_remove", "domain_add", "domain_remove", "user_add", "user_remove"}:
+            value = message.text.strip()
+            async with SessionLocal() as s:
+                if mode == "forbidden_add":
+                    row = await s.scalar(select(ForbiddenWord).where(func.lower(ForbiddenWord.word) == value.lower()))
+                    if row: row.active = True
+                    else: s.add(ForbiddenWord(word=value, active=True))
+                elif mode == "forbidden_remove":
+                    row = await s.scalar(select(ForbiddenWord).where(func.lower(ForbiddenWord.word) == value.lower()))
+                    if row: await s.delete(row)
+                elif mode == "domain_add":
+                    domain = value.lower().replace("https://", "").replace("http://", "").split("/")[0].lstrip("www.")
+                    if not await s.scalar(select(LinkWhitelistDomain).where(LinkWhitelistDomain.domain == domain)): s.add(LinkWhitelistDomain(domain=domain))
+                elif mode == "domain_remove":
+                    domain = value.lower().replace("https://", "").replace("http://", "").split("/")[0].lstrip("www.")
+                    row = await s.scalar(select(LinkWhitelistDomain).where(LinkWhitelistDomain.domain == domain))
+                    if row: await s.delete(row)
+                else:
+                    try: uid = int(value)
+                    except ValueError:
+                        await message.answer("ID Telegram invalide."); return
+                    row = await s.scalar(select(LinkWhitelistUser).where(LinkWhitelistUser.telegram_id == uid))
+                    if mode == "user_add" and not row: s.add(LinkWhitelistUser(telegram_id=uid))
+                    elif mode == "user_remove" and row: await s.delete(row)
+                await s.commit()
+            ADMIN_INPUT_MODE.pop(message.from_user.id, None)
+            await message.answer("✅ Configuration enregistrée.", reply_markup=kb([("⬅ Retour", "mod:words" if mode.startswith("forbidden") else "mod:links"), ("🏠 Menu", "menu")]))
             return
     if message.from_user.id not in BROADCAST_WAITING: return
     if message.text.strip().lower() in {"/annuler","annuler"}:
@@ -1000,5 +1225,5 @@ async def global_error_handler(event: ErrorEvent):
                     "⚠️ Une erreur temporaire est survenue. Votre demande n’a pas été perdue. Réessayez dans quelques instants."
                 )
     finally:
-        print(f"Unhandled bot error: {type(exc).__name__}: {exc}")
+        logger.exception("Erreur callback/Telegram non gérée: %s", exc, exc_info=exc)
     return True
