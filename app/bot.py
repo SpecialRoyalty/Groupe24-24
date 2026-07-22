@@ -22,6 +22,10 @@ r = Router(); dp.include_router(r)
 LAST_MAINTENANCE_AT: datetime | None = None
 LAST_MAINTENANCE_ERROR: str | None = None
 LAST_HEALTH_SIGNATURE: str | None = None
+ADMIN_INPUT_MODE: dict[int, str] = {}
+
+DEFAULT_WELCOME_TEXT = "Bienvenue sur le service d’accès au groupe privé ouvert 24 h/24.\n\nVeuillez d’abord consulter les règles."
+DEFAULT_PUB_AD_TEXT = "Découvrez notre groupe privé. Utilisez le bouton ci-dessous pour commencer votre demande d’accès."
 
 RULES = """<b>Règles du groupe VIP</b>\n\n• Premier média dans les 24 heures.\n• Ensuite, au moins 5 photos ou vidéos valides toutes les 72 heures.\n• Les liens externes sont interdits.\n• Les transferts et redistributions sont interdits.\n• Les infractions entraînent 1 jour, puis 3 jours de restriction, puis un bannissement.\n• Les contenus peuvent être archivés pour restaurer un groupe de remplacement.\n\nEn cliquant sur « J’adhère », vous acceptez ces règles."""
 
@@ -179,7 +183,17 @@ async def start(message: Message):
     rows = [("📜 Consulter les règles", "rules:show")]
     if await is_admin(message.from_user.id):
         rows.append(("⚙️ Panneau administrateur", "admin:home"))
-    await message.answer("Bienvenue sur le service d’accès au groupe privé ouvert 24 h/24.\n\nVeuillez d’abord consulter les règles.", reply_markup=kb(rows))
+    async with SessionLocal() as s:
+        welcome_text = await get_setting(s, "welcome_text", DEFAULT_WELCOME_TEXT)
+        welcome_photo = await get_setting(s, "welcome_photo_file_id", "")
+    markup = kb(rows)
+    if welcome_photo:
+        try:
+            await message.answer_photo(welcome_photo, caption=welcome_text, reply_markup=markup)
+        except Exception:
+            await message.answer(welcome_text, reply_markup=markup)
+    else:
+        await message.answer(welcome_text, reply_markup=markup)
 
 @r.callback_query(F.data == "rules:show")
 async def show_rules(c: CallbackQuery):
@@ -233,6 +247,13 @@ async def payment_choice(c: CallbackQuery):
 
 @r.message(F.chat.type == "private", F.photo)
 async def private_photo(message: Message):
+    mode = ADMIN_INPUT_MODE.get(message.from_user.id)
+    if mode in {"welcome_photo", "pub_photo"} and await is_admin(message.from_user.id):
+        key = "welcome_photo_file_id" if mode == "welcome_photo" else "pub_ad_photo_file_id"
+        async with SessionLocal() as s: await set_setting(s, key, message.photo[-1].file_id)
+        ADMIN_INPUT_MODE.pop(message.from_user.id, None)
+        await message.answer("✅ Image enregistrée.", reply_markup=kb([("⚙️ Panneau administrateur", "admin:home")]))
+        return
     async with SessionLocal() as s:
         user = await get_or_create_user(s, message.from_user); req = await active_request(s, user.id)
         if not req: return
@@ -368,12 +389,13 @@ async def bot_chat_update(event: ChatMemberUpdated):
         if not chat: chat=TelegramChat(telegram_chat_id=event.chat.id,title=event.chat.title or "",role="unassigned"); s.add(chat)
         chat.active=event.new_chat_member.status not in {ChatMemberStatus.LEFT,ChatMemberStatus.KICKED}; await s.commit()
     if event.new_chat_member.status in {ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.MEMBER}:
-        markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⭐ VIP",callback_data=f"chatrole:vip:{event.chat.id}"),InlineKeyboardButton(text="📣 PUB",callback_data=f"chatrole:pub:{event.chat.id}")]])
-        text=f"Nouveau groupe détecté : {event.chat.title}\nID : <code>{event.chat.id}</code>\nUn administrateur du groupe doit attribuer son rôle."
-        # Le message dans le groupe garantit que les admins peuvent configurer même sans avoir démarré le bot en privé.
-        try: await bot.send_message(event.chat.id, text, reply_markup=markup)
-        except Exception: pass
-        for aid in await admin_ids_for_chat(event.chat.id):
+        markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⭐ Définir VIP",callback_data=f"chatrole:vip:{event.chat.id}"),InlineKeyboardButton(text="📣 Définir PUB",callback_data=f"chatrole:pub:{event.chat.id}")]])
+        text=(f"🤫 <b>Nouveau groupe détecté</b>\n\n"
+              f"Nom : <b>{event.chat.title or 'Sans titre'}</b>\n"
+              f"ID : <code>{event.chat.id}</code>\n\n"
+              "Le bot restera silencieux dans ce groupe. Choisissez son rôle ci-dessous.")
+        # La demande de configuration est envoyée uniquement aux ADMIN_IDS en privé.
+        for aid in settings.admin_id_set:
             try: await bot.send_message(aid, text, reply_markup=markup)
             except Exception: pass
 
@@ -571,6 +593,130 @@ async def maintenance_loop():
             print("maintenance error", repr(exc))
         await asyncio.sleep(60)
 
+
+# --- Configuration des contenus visibles ---
+async def welcome_config_screen(c: CallbackQuery):
+    async with SessionLocal() as s:
+        text_value = await get_setting(s, "welcome_text", DEFAULT_WELCOME_TEXT)
+        photo = await get_setting(s, "welcome_photo_file_id", "")
+    preview = text_value[:700] + ("…" if len(text_value) > 700 else "")
+    await c.message.edit_text(
+        "<b>🖼 Configuration de l’accueil</b>\n\n"
+        f"Image : <b>{'configurée' if photo else 'aucune'}</b>\n\n"
+        f"<b>Texte actuel :</b>\n{preview}",
+        reply_markup=kb([
+            ("✍️ Modifier le texte", "admin:welcome_text"),
+            ("🖼 Modifier l’image", "admin:welcome_photo"),
+            ("🗑 Retirer l’image", "admin:welcome_photo_remove"),
+            ("👁 Prévisualiser", "admin:welcome_preview"),
+            ("⬅️ Retour", "admin:home"),
+        ]),
+    )
+
+@r.callback_query(F.data == "admin:welcome")
+async def admin_welcome(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    await welcome_config_screen(c); await c.answer()
+
+@r.callback_query(F.data == "admin:welcome_text")
+async def admin_welcome_text(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    ADMIN_INPUT_MODE[c.from_user.id] = "welcome_text"
+    await c.message.edit_text("Envoyez maintenant le nouveau texte d’accueil en message privé. HTML simple accepté.\n\nEnvoyez /annuler pour quitter.")
+    await c.answer()
+
+@r.callback_query(F.data == "admin:welcome_photo")
+async def admin_welcome_photo(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    ADMIN_INPUT_MODE[c.from_user.id] = "welcome_photo"
+    await c.message.edit_text("Envoyez maintenant l’image d’accueil en tant que photo.\n\nEnvoyez /annuler pour quitter.")
+    await c.answer()
+
+@r.callback_query(F.data == "admin:welcome_photo_remove")
+async def admin_welcome_photo_remove(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    async with SessionLocal() as s: await set_setting(s, "welcome_photo_file_id", "")
+    await c.answer("Image retirée"); await welcome_config_screen(c)
+
+@r.callback_query(F.data == "admin:welcome_preview")
+async def admin_welcome_preview(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    async with SessionLocal() as s:
+        text_value=await get_setting(s,"welcome_text",DEFAULT_WELCOME_TEXT); photo=await get_setting(s,"welcome_photo_file_id","")
+    markup=kb([("📜 Consulter les règles","rules:show")])
+    if photo: await bot.send_photo(c.from_user.id, photo, caption=text_value, reply_markup=markup)
+    else: await bot.send_message(c.from_user.id, text_value, reply_markup=markup)
+    await c.answer("Prévisualisation envoyée")
+
+async def pub_config_screen(c: CallbackQuery):
+    async with SessionLocal() as s:
+        text_value=await get_setting(s,"pub_ad_text",DEFAULT_PUB_AD_TEXT); photo=await get_setting(s,"pub_ad_photo_file_id","")
+    preview=text_value[:700]+("…" if len(text_value)>700 else "")
+    await c.message.edit_text(
+        "<b>📣 Publicité des groupes PUB</b>\n\n"
+        f"Image : <b>{'configurée' if photo else 'aucune'}</b>\n\n<b>Texte actuel :</b>\n{preview}",
+        reply_markup=kb([
+            ("✍️ Modifier le texte", "admin:pub_text"),
+            ("🖼 Modifier l’image", "admin:pub_photo"),
+            ("🗑 Retirer l’image", "admin:pub_photo_remove"),
+            ("👁 Prévisualiser", "admin:pub_preview"),
+            ("🚀 Envoyer aux groupes PUB", "admin:pub_send"),
+            ("⬅️ Retour", "admin:home"),
+        ]),
+    )
+
+@r.callback_query(F.data == "admin:pub_ad")
+async def admin_pub_ad(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    await pub_config_screen(c); await c.answer()
+
+@r.callback_query(F.data == "admin:pub_text")
+async def admin_pub_text(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    ADMIN_INPUT_MODE[c.from_user.id] = "pub_text"
+    await c.message.edit_text("Envoyez maintenant le texte de la publicité PUB.\n\nEnvoyez /annuler pour quitter.")
+    await c.answer()
+
+@r.callback_query(F.data == "admin:pub_photo")
+async def admin_pub_photo(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    ADMIN_INPUT_MODE[c.from_user.id] = "pub_photo"
+    await c.message.edit_text("Envoyez maintenant l’image de la publicité PUB en tant que photo.\n\nEnvoyez /annuler pour quitter.")
+    await c.answer()
+
+@r.callback_query(F.data == "admin:pub_photo_remove")
+async def admin_pub_photo_remove(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    async with SessionLocal() as s: await set_setting(s,"pub_ad_photo_file_id","")
+    await c.answer("Image retirée"); await pub_config_screen(c)
+
+@r.callback_query(F.data == "admin:pub_preview")
+async def admin_pub_preview(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    async with SessionLocal() as s:
+        text_value=await get_setting(s,"pub_ad_text",DEFAULT_PUB_AD_TEXT); photo=await get_setting(s,"pub_ad_photo_file_id","")
+    markup=kb([("🚀 Demander mon accès","rules:show")])
+    if photo: await bot.send_photo(c.from_user.id,photo,caption=text_value,reply_markup=markup)
+    else: await bot.send_message(c.from_user.id,text_value,reply_markup=markup)
+    await c.answer("Prévisualisation envoyée")
+
+@r.callback_query(F.data == "admin:pub_send")
+async def admin_pub_send(c: CallbackQuery):
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    async with SessionLocal() as s:
+        chats=list((await s.scalars(select(TelegramChat).where(TelegramChat.role=="pub",TelegramChat.active.is_(True)))).all())
+        text_value=await get_setting(s,"pub_ad_text",DEFAULT_PUB_AD_TEXT); photo=await get_setting(s,"pub_ad_photo_file_id","")
+    if not chats: return await c.answer("Aucun groupe PUB actif", show_alert=True)
+    me=await bot.get_me(); markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Demander mon accès",url=f"https://t.me/{me.username}?start=pub")]])
+    sent=failed=0
+    for chat in chats:
+        try:
+            if photo: await bot.send_photo(chat.telegram_chat_id,photo,caption=text_value,reply_markup=markup)
+            else: await bot.send_message(chat.telegram_chat_id,text_value,reply_markup=markup)
+            sent+=1
+        except Exception: failed+=1
+    await c.answer(f"Envoyée : {sent} | Échecs : {failed}", show_alert=True)
+
 # --- Extensions production : files d'attente, broadcast, statistiques et navigation ---
 BROADCAST_WAITING: set[int] = set()
 
@@ -650,6 +796,18 @@ async def broadcast_cancel_button(c: CallbackQuery):
 
 @r.message(F.chat.type == "private", F.text)
 async def broadcast_text(message: Message):
+    mode = ADMIN_INPUT_MODE.get(message.from_user.id)
+    if mode and await is_admin(message.from_user.id):
+        if message.text.strip().lower() in {"/annuler", "annuler"}:
+            ADMIN_INPUT_MODE.pop(message.from_user.id, None)
+            await message.answer("Configuration annulée.", reply_markup=kb([("⚙️ Panneau administrateur", "admin:home")]))
+            return
+        if mode in {"welcome_text", "pub_text"}:
+            key = "welcome_text" if mode == "welcome_text" else "pub_ad_text"
+            async with SessionLocal() as s: await set_setting(s, key, message.text)
+            ADMIN_INPUT_MODE.pop(message.from_user.id, None)
+            await message.answer("✅ Texte enregistré.", reply_markup=kb([("⚙️ Panneau administrateur", "admin:home")]))
+            return
     if message.from_user.id not in BROADCAST_WAITING: return
     if message.text.strip().lower() in {"/annuler","annuler"}:
         BROADCAST_WAITING.discard(message.from_user.id); return await message.answer("Broadcast annulé.")
