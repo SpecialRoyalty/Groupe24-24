@@ -1,0 +1,8 @@
+aiogram>=3.13,<4
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+SQLAlchemy[asyncio]>=2.0,<3
+asyncpg>=0.29,<1
+pydantic-settings>=2.5,<3
+python-multipart>=0.0.9,<1
+alembic>=1.13,<2
