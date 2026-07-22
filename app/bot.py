@@ -32,8 +32,7 @@ logger = logging.getLogger("telegram-vip-bot")
 DEFAULT_WELCOME_TEXT = "Bienvenue sur le service d’accès au groupe privé ouvert 24 h/24.\n\nVeuillez d’abord consulter les règles."
 DEFAULT_PUB_AD_TEXT = "Découvrez notre groupe privé. Utilisez le bouton ci-dessous pour commencer votre demande d’accès."
 
-RULES = """<b>Règles du groupe VIP</b>\n\n• Premier média dans les 24 heures.\n• Ensuite, au moins 5 photos ou vidéos valides toutes les 72 heures.\n• Les liens externes sont interdits.\n• Les transferts et redistributions sont interdits.\n• Les infractions entraînent 1 jour, puis 3 jours de restriction, puis un bannissement.\n• Les contenus peuvent être archivés pour restaurer un groupe de remplacement.\n\nEn cliquant sur « J’adhère », vous acceptez ces règles."""
-
+RULES = """<b>Règles du groupe VIP</b>\n\n• La participation est obligatoire : vous devez envoyer des photos ou des vidéos au moins une fois tous les 3 jours.\n• Les liens externes sont interdits.\n• Les transferts et redistributions de contenu sont interdits.\n• Les bannissements sont définitifs.\n• Le contenu n'est jamais supprimé afin que vous puissiez en profiter à tout moment.\n\nEn cliquant sur « J’adhère », vous acceptez ces règles."""
 ADMIN_STATUSES = {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
 async def edit_or_send(message: Message, text_value: str, **kwargs):
