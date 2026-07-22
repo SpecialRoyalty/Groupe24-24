@@ -76,3 +76,14 @@ Après le déploiement, ouvrez `/ready` dans le navigateur pour voir si la base 
 Le webhook répond toujours en HTTP 200 après réception valide d'une mise à jour Telegram, même lorsqu'une action métier échoue. Cela évite les répétitions de mise à jour et les boucles `500 Internal Server Error`.
 
 Si un administrateur tente d'ouvrir ou fermer le groupe avant d'avoir défini un groupe VIP, le bot affiche désormais une explication et un bouton vers **Groupes détectés**. Les erreurs inattendues affichent un message dans Telegram avec un accès direct à **Santé du système**.
+
+## Contenus configurables
+
+Le panneau administrateur permet maintenant de configurer :
+
+- le texte et l'image du message d'accueil privé ;
+- le texte et l'image de la publicité destinée aux groupes PUB ;
+- la prévisualisation de chaque contenu ;
+- l'envoi manuel de la publicité à tous les groupes PUB actifs.
+
+Lorsqu'il est ajouté à un groupe, le bot n'envoie aucun message dans ce groupe. Il enregistre le groupe et adresse la demande de configuration uniquement en message privé aux identifiants présents dans `ADMIN_IDS`. Chaque administrateur doit avoir démarré le bot en privé au moins une fois pour recevoir ce message.
