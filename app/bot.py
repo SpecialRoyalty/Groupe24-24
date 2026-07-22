@@ -52,6 +52,41 @@ async def edit_message(message: Message, text_value: str, **kwargs):
                 return await message.answer(text_value, **kwargs)
         raise
 
+
+async def paid_access_state(session, user_id: int):
+    """Retourne la dernière demande payée validée et indique si son lien a déjà été utilisé."""
+    req = await session.scalar(
+        select(AccessRequest)
+        .where(
+            AccessRequest.user_id == user_id,
+            AccessRequest.method == AccessMethod.payment.value,
+            AccessRequest.status.in_([AccessStatus.approved.value, AccessStatus.member.value]),
+        )
+        .order_by(AccessRequest.id.desc())
+    )
+    if not req:
+        return None, False
+    used_invite = await session.scalar(
+        select(Invite).where(Invite.request_id == req.id, Invite.used_at.is_not(None)).order_by(Invite.id.desc())
+    )
+    return req, bool(used_invite or req.status == AccessStatus.member.value)
+
+async def show_existing_paid_access(message: Message, req: AccessRequest, link_used: bool):
+    if link_used:
+        await edit_message(
+            message,
+            "✅ <b>Votre paiement a déjà été validé.</b>\n\n"
+            "Votre lien personnel a déjà été utilisé. Vous avez donc déjà effectué le parcours de souscription et vous ne pouvez pas recommencer.",
+            reply_markup=kb([("🏠 Fermer", "paid:already_used")]),
+        )
+    else:
+        await edit_message(
+            message,
+            "✅ <b>Votre paiement a déjà été validé.</b>\n\n"
+            "Vous ne pouvez pas effectuer une nouvelle souscription. Utilisez votre accès déjà approuvé.",
+            reply_markup=kb([("🔗 Générer mon lien 24 h", f"invite:create:{req.id}")]),
+        )
+
 async def admin_ids_for_chat(chat_id: int) -> set[int]:
     try:
         admins = await bot.get_chat_administrators(chat_id)
@@ -200,7 +235,11 @@ async def automatic_health_alerts() -> None:
 async def start(message: Message):
     if message.chat.type != "private": return
     async with SessionLocal() as s:
-        await get_or_create_user(s, message.from_user)
+        user = await get_or_create_user(s, message.from_user)
+        paid_req, link_used = await paid_access_state(s, user.id)
+    if paid_req:
+        await show_existing_paid_access(message, paid_req, link_used)
+        return
     rows = [("📜 Consulter les règles", "rules:show")]
     if await is_admin(message.from_user.id):
         rows.append(("⚙️ Panneau administrateur", "admin:home"))
@@ -223,7 +262,13 @@ async def show_rules(c: CallbackQuery):
 @r.callback_query(F.data == "rules:accept")
 async def accept_rules(c: CallbackQuery):
     async with SessionLocal() as s:
+        user = await get_or_create_user(s, c.from_user)
+        paid_req, link_used = await paid_access_state(s, user.id)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
+    if paid_req:
+        await show_existing_paid_access(c.message, paid_req, link_used)
+        await c.answer("Votre paiement est déjà validé.", show_alert=True)
+        return
     text = "Choisissez votre méthode d’accès :" if enabled else "L’accès est actuellement disponible uniquement par paiement."
     await edit_message(c.message, text, reply_markup=access_methods(enabled)); await c.answer()
 
@@ -232,7 +277,12 @@ async def choose_access(c: CallbackQuery):
     method = c.data.split(":",1)[1]
     async with SessionLocal() as s:
         user = await get_or_create_user(s, c.from_user)
+        paid_req, link_used = await paid_access_state(s, user.id)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
+        if paid_req:
+            await show_existing_paid_access(c.message, paid_req, link_used)
+            await c.answer("Vous avez déjà payé : nouvelle souscription bloquée.", show_alert=True)
+            return
         if method != "payment" and not enabled:
             await c.answer("Cette option est désactivée.", show_alert=True); return
         req = await create_request(s, user.id, method)
@@ -408,6 +458,22 @@ async def join_request(j: ChatJoinRequest):
         await s.commit()
     await bot.send_message(user.telegram_id,"Bienvenue dans le groupe VIP. Consultez /statut pour suivre votre activité.")
 
+
+@r.callback_query(F.data == "paid:already_used")
+async def paid_already_used(c: CallbackQuery):
+    await c.answer("Votre accès a déjà été utilisé.", show_alert=True)
+
+@r.message(F.new_chat_members)
+async def delete_join_service_message(message: Message):
+    """Supprime les messages système d’entrée/acceptation dans les groupes."""
+    with suppress(Exception):
+        await message.delete()
+
+@r.message(F.left_chat_member)
+async def delete_leave_service_message(message: Message):
+    """Supprime les messages système de sortie dans les groupes."""
+    with suppress(Exception):
+        await message.delete()
 
 @r.chat_member()
 async def member_update(event: ChatMemberUpdated):
@@ -777,7 +843,13 @@ BROADCAST_WAITING: set[int] = set()
 @r.callback_query(F.data == "menu")
 async def back_to_menu(c: CallbackQuery):
     async with SessionLocal() as s:
+        user = await get_or_create_user(s, c.from_user)
+        paid_req, link_used = await paid_access_state(s, user.id)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
+    if paid_req:
+        await show_existing_paid_access(c.message, paid_req, link_used)
+        await c.answer()
+        return
     await edit_message(c.message, "Choisissez votre méthode d’accès :" if enabled else "L’accès au groupe est actuellement disponible uniquement par paiement.", reply_markup=access_methods(enabled))
     await c.answer()
 
