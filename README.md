@@ -53,3 +53,20 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 L’endpoint `GET /health` vérifie la connexion à la base. Le diagnostic complet est accessible avec le bouton **🩺 Santé du système**.
+
+## Diagnostic Railway : healthcheck indisponible
+
+La route `/health` est une sonde de vie et renvoie HTTP 200 dès que le serveur FastAPI écoute.
+La route `/ready` vérifie séparément PostgreSQL et le webhook Telegram ; elle peut renvoyer 503 avec le détail de l'erreur sans provoquer l'arrêt du déploiement.
+
+Variables minimales :
+
+```env
+BOT_TOKEN=123456:telegram-token
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+PUBLIC_BASE_URL=https://votre-domaine.up.railway.app
+WEBHOOK_SECRET=une_valeur_aleatoire_stable
+```
+
+`PUBLIC_BASE_URL` peut être omise si Railway injecte `RAILWAY_PUBLIC_DOMAIN`. Le bot ajoute alors automatiquement `https://`.
+Après le déploiement, ouvrez `/ready` dans le navigateur pour voir si la base ou le webhook restent en erreur.
