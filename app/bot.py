@@ -1,11 +1,12 @@
 from __future__ import annotations
 import asyncio
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, ChatJoinRequest, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, ChatJoinRequest, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select, func, text
 from .config import get_settings
 from .db import SessionLocal
@@ -423,10 +424,37 @@ async def toggle_options(c: CallbackQuery):
 
 @r.callback_query(F.data=="admin:toggle_group")
 async def toggle_group(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return
+    if not await is_admin(c.from_user.id):
+        await c.answer("Accès refusé", show_alert=True)
+        return
+
     async with SessionLocal() as s:
-        current=(await get_setting(s,"group_open","1"))=="1"; await set_group_open(bot,s,not current); opt=(await get_setting(s,"alternative_access_enabled","1"))=="1"
-    await c.message.edit_reply_markup(reply_markup=admin_home(opt,not current)); await c.answer("Permissions modifiées")
+        current = (await get_setting(s, "group_open", "1")) == "1"
+        opt = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
+        try:
+            await set_group_open(bot, s, not current)
+        except RuntimeError as exc:
+            await c.answer(str(exc), show_alert=True)
+            await c.message.edit_text(
+                "⚠️ <b>Action impossible</b>\n\n"
+                "Aucun groupe VIP n’est encore configuré.\n\n"
+                "Ajoutez le bot à votre groupe, donnez-lui les droits administrateur, "
+                "puis ouvrez <b>Groupes détectés</b> et définissez ce groupe comme VIP.",
+                reply_markup=kb([("👥 Groupes détectés", "admin:groups"), ("⬅️ Retour", "admin:home")]),
+            )
+            return
+        except Exception as exc:
+            await c.answer("Impossible de modifier le groupe. Consultez Santé du système.", show_alert=True)
+            await c.message.edit_text(
+                "❌ <b>Modification impossible</b>\n\n"
+                f"Telegram a refusé la modification : <code>{type(exc).__name__}</code>.\n"
+                "Vérifiez que le bot est administrateur du groupe VIP et possède le droit de modifier les permissions.",
+                reply_markup=kb([("🩺 Santé du système", "admin:health"), ("⬅️ Retour", "admin:home")]),
+            )
+            return
+
+    await c.message.edit_reply_markup(reply_markup=admin_home(opt, not current))
+    await c.answer("Groupe ouvert" if not current else "Groupe fermé")
 
 @r.callback_query(F.data=="admin:groups")
 async def admin_groups(c: CallbackQuery):
@@ -651,3 +679,33 @@ async def admin_stats(c: CallbackQuery):
         approved=int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.status.in_([AccessStatus.approved.value,AccessStatus.member.value]))) or 0)
     await c.message.edit_text(f"<b>📊 Statistiques</b>\n\nUtilisateurs enregistrés : <b>{users}</b>\nMembres VIP actifs : <b>{active}</b>\nAccès validés : <b>{approved}</b>\nPaiements à vérifier : <b>{pending_pay}</b>\nDossiers à vérifier : <b>{pending_media}</b>", reply_markup=kb([("🔄 Actualiser","admin:stats"),("⬅️ Retour","admin:home")]))
     await c.answer()
+
+
+@r.error()
+async def global_error_handler(event: ErrorEvent):
+    """Transforme les erreurs inattendues en réponse utilisateur au lieu d'un webhook 500."""
+    exc = event.exception
+    update = event.update
+    try:
+        if update.callback_query:
+            callback = update.callback_query
+            with suppress(Exception):
+                await callback.answer(
+                    "Une erreur est survenue. Ouvrez Santé du système ou réessayez.",
+                    show_alert=True,
+                )
+            if callback.message:
+                with suppress(Exception):
+                    await callback.message.answer(
+                        "⚠️ <b>Le bot a rencontré une erreur</b>\n\n"
+                        "L’action n’a pas été appliquée. Vous pouvez relancer le diagnostic depuis le panneau administrateur.",
+                        reply_markup=kb([("🩺 Santé du système", "admin:health"), ("🏠 Panneau admin", "admin:home")]),
+                    )
+        elif update.message:
+            with suppress(Exception):
+                await update.message.answer(
+                    "⚠️ Une erreur temporaire est survenue. Votre demande n’a pas été perdue. Réessayez dans quelques instants."
+                )
+    finally:
+        print(f"Unhandled bot error: {type(exc).__name__}: {exc}")
+    return True

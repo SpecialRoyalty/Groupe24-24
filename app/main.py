@@ -134,5 +134,19 @@ async def telegram_webhook(
     if x_telegram_bot_api_secret_token != settings.resolved_webhook_secret:
         raise HTTPException(status_code=403, detail="invalid secret")
     update = Update.model_validate(await request.json(), context={"bot": bot})
-    await dp.feed_update(bot, update)
+    try:
+        await dp.feed_update(bot, update)
+    except Exception as exc:
+        # Telegram réessaie les mises à jour reçues avec un code 500, ce qui peut
+        # provoquer une boucle. L'erreur est journalisée, mais le webhook reste sain.
+        logger.exception(
+            "Erreur inattendue pendant le traitement de la mise à jour Telegram %s",
+            update.update_id,
+        )
+        return {
+            "ok": False,
+            "handled": True,
+            "update_id": update.update_id,
+            "error": type(exc).__name__,
+        }
     return {"ok": True}
