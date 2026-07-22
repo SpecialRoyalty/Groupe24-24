@@ -70,3 +70,9 @@ WEBHOOK_SECRET=une_valeur_aleatoire_stable
 
 `PUBLIC_BASE_URL` peut être omise si Railway injecte `RAILWAY_PUBLIC_DOMAIN`. Le bot ajoute alors automatiquement `https://`.
 Après le déploiement, ouvrez `/ready` dans le navigateur pour voir si la base ou le webhook restent en erreur.
+
+## Gestion des erreurs Railway / Telegram
+
+Le webhook répond toujours en HTTP 200 après réception valide d'une mise à jour Telegram, même lorsqu'une action métier échoue. Cela évite les répétitions de mise à jour et les boucles `500 Internal Server Error`.
+
+Si un administrateur tente d'ouvrir ou fermer le groupe avant d'avoir défini un groupe VIP, le bot affiche désormais une explication et un bouton vers **Groupes détectés**. Les erreurs inattendues affichent un message dans Telegram avec un accès direct à **Santé du système**.
