@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+from html import escape
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F, Router
@@ -11,7 +12,7 @@ from aiogram.types import CallbackQuery, ChatJoinRequest, ChatMemberUpdated, Err
 from sqlalchemy import select, func, text
 from .config import get_settings
 from .db import SessionLocal
-from .keyboards import access_methods, admin_home, kb, payment_keyboard, rules_keyboard
+from .keyboards import access_methods, admin_home, kb, payment_details_keyboard, payment_keyboard, rules_keyboard
 from .models import AccessMethod, AccessRequest, AccessStatus, ActivityMedia, Invite, MediaSubmission, Membership, PaymentProof, Referral, TelegramChat, User
 from .services import active_request, activity_count, create_personal_invite, create_request, get_or_create_user, get_setting, pub_chat, set_group_open, set_setting, validated_referrals, vip_chat
 
@@ -243,10 +244,28 @@ async def choose_access(c: CallbackQuery):
         async with SessionLocal() as s:
             pub = await pub_chat(s)
         if not pub:
-            await edit_message(c.message, "Le groupe PUB n’est pas encore configuré. Contactez un administrateur."); return
+            await edit_message(c.message, "Le groupe PUB n’est pas encore configuré. Contactez un administrateur.", reply_markup=kb([("⬅️ Retour", "menu")])) ; return
         link = await bot.create_chat_invite_link(pub.telegram_chat_id, name=f"REF-{req.id}", expire_date=req.expires_at, member_limit=99999)
-        await edit_message(c.message, f"Votre lien personnel de parrainage :\n{link.invite_link}\n\nObjectif : <b>{settings.referral_target}</b> invitations validées en 48 heures.\nProgression : <b>0/{settings.referral_target}</b>", reply_markup=kb([("📊 Voir ma progression", f"ref:progress:{req.id}")]))
+        await edit_message(c.message, f"Votre lien personnel de parrainage :\n{link.invite_link}\n\nObjectif : <b>{settings.referral_target}</b> invitations validées en 48 heures.\nProgression : <b>0/{settings.referral_target}</b>", reply_markup=kb([("📊 Voir ma progression", f"ref:progress:{req.id}"), ("⬅️ Retour", "menu")]))
     await c.answer()
+
+@r.callback_query(F.data == "paymethods")
+async def payment_methods_back(c: CallbackQuery):
+    async with SessionLocal() as s:
+        user = await get_or_create_user(s, c.from_user)
+        req = await active_request(s, user.id)
+    if not req or req.method != AccessMethod.payment.value:
+        await c.answer("Aucune demande de paiement active.", show_alert=True)
+        return
+    await edit_message(
+        c.message,
+        f"Le prix de l’accès est de <b>{settings.entry_price_eur} €</b>.\n"
+        f"Référence : <code>{escape(req.reference)}</code>\n\n"
+        "Choisissez le moyen de paiement.",
+        reply_markup=payment_keyboard(),
+    )
+    await c.answer()
+
 
 @r.callback_query(F.data.startswith("payment:"))
 async def payment_choice(c: CallbackQuery):
@@ -262,7 +281,22 @@ async def payment_choice(c: CallbackQuery):
             "Ne classez pas volontairement un achat d’accès comme un envoi personnel afin de contourner les frais ou protections. "
             "Un paiement non conforme pourra être refusé et transmis aux administrateurs pour examen."
         )
-    await edit_message(c.message, f"Envoyez exactement <b>{settings.entry_price_eur} €</b>.\nMoyen : <b>{method.title()}</b>\nDestinataire : <code>{details}</code>\nRéférence obligatoire : <code>{req.reference}</code>{extra}\n\nEnvoyez ensuite la capture d’écran ici.")
+    safe_details = escape(details or "Non configuré")
+    if details and details.lower().startswith(("https://", "http://")):
+        destination = f'<a href="{safe_details}">{safe_details}</a>'
+    else:
+        destination = f"<code>{safe_details}</code>"
+
+    await edit_message(
+        c.message,
+        f"Envoyez exactement <b>{settings.entry_price_eur} €</b>.\n"
+        f"Moyen : <b>{method.title()}</b>\n"
+        f"Destinataire : {destination}\n"
+        f"Référence obligatoire : <code>{escape(req.reference)}</code>{extra}\n\n"
+        "Envoyez ensuite la capture d’écran ici.",
+        reply_markup=payment_details_keyboard(),
+        disable_web_page_preview=True,
+    )
     await c.answer()
 
 @r.message(F.chat.type == "private", F.photo)
@@ -283,7 +317,7 @@ async def private_photo(message: Message):
             cap = f"Paiement à vérifier\nUtilisateur : {message.from_user.full_name} (@{message.from_user.username or '-'})\nID : <code>{message.from_user.id}</code>\nRéférence : <code>{req.reference}</code>"
             markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Valider", callback_data=f"review:pay:ok:{req.id}"),InlineKeyboardButton(text="❌ Refuser", callback_data=f"review:pay:no:{req.id}")]])
             await notify_admins("send_photo", proof.file_id, caption=cap, reply_markup=markup)
-            await message.answer("Votre justificatif a été reçu et envoyé aux administrateurs.")
+            await message.answer("Votre justificatif a été reçu et envoyé aux administrateurs.", reply_markup=kb([("🏠 Menu principal", "menu")]))
         elif req.method == AccessMethod.media.value:
             count = int(await s.scalar(select(func.count(MediaSubmission.id)).where(MediaSubmission.request_id == req.id)) or 0)
             if count >= 10: await message.answer("Maximum de 10 médias atteint."); return
@@ -319,7 +353,7 @@ async def submit_media(c: CallbackQuery):
                 else: await bot.send_video(aid,f.file_id)
         except Exception:
             pass
-    await edit_message(c.message, "Votre dossier a été transmis aux modérateurs."); await c.answer()
+    await edit_message(c.message, "Votre dossier a été transmis aux modérateurs.", reply_markup=kb([("🏠 Menu principal", "menu")])) ; await c.answer()
 
 @r.callback_query(F.data.startswith("review:"))
 async def review(c: CallbackQuery):
@@ -343,7 +377,7 @@ async def invite_create(c: CallbackQuery):
         if not req or req.user_id!=user.id or req.status!=AccessStatus.approved.value: await c.answer("Accès non autorisé",show_alert=True); return
         old=await s.scalar(select(Invite).where(Invite.user_id==user.id,Invite.revoked.is_(False),Invite.used_at.is_(None),Invite.expires_at>datetime.now(timezone.utc)))
         inv=old or await create_personal_invite(bot,s,user,req)
-    await edit_message(c.message, f"Votre lien personnel est valable 24 heures :\n{inv.invite_link}\n\nNe le partagez pas."); await c.answer()
+    await edit_message(c.message, f"Votre lien personnel est valable 24 heures :\n{inv.invite_link}\n\nNe le partagez pas.", reply_markup=kb([("🏠 Menu principal", "menu")])) ; await c.answer()
 
 @r.chat_join_request()
 async def join_request(j: ChatJoinRequest):
