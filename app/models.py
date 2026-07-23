@@ -148,6 +148,14 @@ class MembershipRecovery(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class LifetimeMediaAccess(Base):
+    __tablename__ = "lifetime_media_access"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    payment_request_id: Mapped[int | None] = mapped_column(ForeignKey("access_requests.id"), unique=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
 class ActivityMedia(Base):
     __tablename__ = "activity_media"
     id: Mapped[int] = mapped_column(primary_key=True)

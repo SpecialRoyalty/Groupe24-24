@@ -33,11 +33,11 @@ async def set_setting(session: AsyncSession, key: str, value: str):
 async def active_request(session: AsyncSession, user_id: int):
     return await session.scalar(select(AccessRequest).where(AccessRequest.user_id == user_id, AccessRequest.status.in_([AccessStatus.in_progress.value, AccessStatus.pending_review.value, AccessStatus.approved.value])).order_by(AccessRequest.id.desc()))
 
-async def create_request(session: AsyncSession, user_id: int, method: str) -> AccessRequest:
+async def create_request(session: AsyncSession, user_id: int, method: str, reference_prefix: str = "VIP") -> AccessRequest:
     old = await active_request(session, user_id)
     if old and old.status != AccessStatus.approved.value:
         old.status = AccessStatus.rejected.value
-    req = AccessRequest(user_id=user_id, method=method, reference=f"VIP-{secrets.token_hex(3).upper()}")
+    req = AccessRequest(user_id=user_id, method=method, reference=f"{reference_prefix}-{secrets.token_hex(3).upper()}")
     if method == "referral": req.expires_at = datetime.now(timezone.utc) + timedelta(hours=settings.referral_window_hours)
     session.add(req); await session.commit(); await session.refresh(req)
     return req

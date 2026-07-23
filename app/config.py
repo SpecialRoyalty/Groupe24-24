@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     revolut_details: str = ""
     entry_price_eur: int = 2
     reentry_price_eur: int = 5
+    lifetime_reentry_price_eur: int = 10
+    first_media_reminder_hours: int = 12
+    first_media_final_reminder_minutes: int = 60
     referral_target: int = 20
     referral_window_hours: int = 48
     referral_validation_minutes: int = 5

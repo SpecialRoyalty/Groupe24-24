@@ -14,7 +14,7 @@ from sqlalchemy import select, func, text
 from .config import get_settings
 from .db import SessionLocal
 from .keyboards import access_methods, admin_home, kb, payment_details_keyboard, payment_keyboard, rules_keyboard
-from .models import AccessMethod, AccessRequest, AccessStatus, ActivityMedia, Invite, MediaSubmission, Membership, PaymentProof, Referral, TelegramChat, User, ForbiddenWord, LinkWhitelistDomain, LinkWhitelistUser, MediaHash, ModerationStat, MembershipRecovery
+from .models import AccessMethod, AccessRequest, AccessStatus, ActivityMedia, Invite, MediaSubmission, Membership, PaymentProof, Referral, TelegramChat, User, ForbiddenWord, LinkWhitelistDomain, LinkWhitelistUser, MediaHash, ModerationStat, MembershipRecovery, LifetimeMediaAccess
 from .services import active_request, activity_count, create_personal_invite, create_request, get_or_create_user, get_setting, pub_chat, set_group_open, set_setting, validated_referrals, vip_chat
 from .moderation import apply_sanction, forbidden_word_hit, links_blocked, process_repost, safe_delete, stat_inc
 
@@ -104,13 +104,41 @@ async def recovery_for_user(session, user_id: int) -> MembershipRecovery | None:
     )
 
 
+async def has_lifetime_media_access(session, user_id: int) -> bool:
+    return bool(await session.scalar(
+        select(LifetimeMediaAccess.id).where(
+            LifetimeMediaAccess.user_id == user_id,
+            LifetimeMediaAccess.active.is_(True),
+        )
+    ))
+
+
+def payment_amount_for_reference(reference: str | None) -> int:
+    ref = reference or ""
+    if ref.startswith("LIFETIME-"):
+        return settings.lifetime_reentry_price_eur
+    if ref.startswith(("REJOIN-", "REJOIN5-")):
+        return settings.reentry_price_eur
+    return settings.entry_price_eur
+
+
+def recovery_payment_keyboard(recovery_id: int):
+    return kb([
+        (f"💳 Revenir pour {settings.reentry_price_eur} €", f"recovery:payment:{recovery_id}"),
+        (f"♾ Revenir à vie pour {settings.lifetime_reentry_price_eur} €", f"recovery:lifetime:{recovery_id}"),
+        ("🏠 Menu", "menu"),
+    ])
+
+
 async def show_existing_paid_access(message: Message, req: AccessRequest, link_used: bool, recovery: MembershipRecovery | None = None):
     if recovery:
         await message.answer(
-            "✅ <b>Votre paiement reste valide.</b>\n\n"
-            "Vous avez été retiré du groupe car le premier média n’a pas été publié dans le délai prévu. "
-            "Vous pouvez revenir sans repayer. Après votre retour, un nouveau délai commencera et les rappels seront envoyés automatiquement.",
-            reply_markup=kb([("🔁 Revenir dans le groupe", f"recovery:invite:{recovery.id}"), ("🏠 Menu", "menu")]),
+            "⚠️ <b>Vous avez été retiré du groupe.</b>\n\n"
+            "Aucun premier média n’a été publié dans le délai prévu. "
+            f"Vous pouvez revenir pour <b>{settings.reentry_price_eur} €</b> avec le parcours normal, "
+            f"ou choisir l’accès permanent à <b>{settings.lifetime_reentry_price_eur} €</b> sans obligation d’envoyer des médias. "
+            "Après un retour classique, les rappels et l’expulsion automatique restent actifs.",
+            reply_markup=recovery_payment_keyboard(recovery.id),
         )
     elif link_used:
         await message.answer(
@@ -256,11 +284,23 @@ async def build_health_report() -> tuple[str, list[str], str]:
             impacted = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.removed_at.is_not(None), MembershipRecovery.rejoined_at.is_(None))) or 0)
             pending_contact = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.removed_at.is_not(None), MembershipRecovery.contacted_at.is_(None))) or 0)
             contacted = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.removed_at.is_not(None), MembershipRecovery.contacted_at.is_not(None))) or 0)
+            contact_failures = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.removed_at.is_not(None), MembershipRecovery.last_contact_error.is_not(None))) or 0)
             future_reminders = int(await s.scalar(select(func.count(Membership.id)).where(Membership.active.is_(True), Membership.first_media_at.is_(None))) or 0)
-        checks.append(f"👥 Réintégrations concernées : {impacted}")
+            first_reminders_sent = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.reminder_24h_sent_at.is_not(None), MembershipRecovery.removed_at.is_(None))) or 0)
+            final_reminders_sent = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.reminder_1h_sent_at.is_not(None), MembershipRecovery.removed_at.is_(None))) or 0)
+            pending_reentry_payments = int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.method == AccessMethod.payment.value, AccessRequest.reference.like("REJOIN%"), AccessRequest.status.in_([AccessStatus.in_progress.value, AccessStatus.pending_review.value]))) or 0)
+            pending_lifetime_payments = int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.method == AccessMethod.payment.value, AccessRequest.reference.like("LIFETIME-%"), AccessRequest.status.in_([AccessStatus.in_progress.value, AccessStatus.pending_review.value]))) or 0)
+            lifetime_members = int(await s.scalar(select(func.count(LifetimeMediaAccess.id)).where(LifetimeMediaAccess.active.is_(True))) or 0)
+        checks.append(f"👥 Expulsés pouvant choisir {settings.reentry_price_eur} € ou {settings.lifetime_reentry_price_eur} € : {impacted}")
         checks.append(f"✅ Personnes impactées contactées : {contacted}")
         checks.append(f"📨 Personnes restant à contacter : {pending_contact}")
-        checks.append(f"⏰ Membres suivis pour rappels : {future_reminders}")
+        checks.append(f"❌ Échecs de contact : {contact_failures}")
+        checks.append(f"💳 Retours à {settings.reentry_price_eur} € en cours : {pending_reentry_payments}")
+        checks.append(f"♾ Accès permanents à {settings.lifetime_reentry_price_eur} € en cours : {pending_lifetime_payments}")
+        checks.append(f"🛡 Membres permanents actifs : {lifetime_members}")
+        checks.append(f"⏰ Membres suivis avant expulsion : {future_reminders}")
+        checks.append(f"🔔 Premiers rappels envoyés : {first_reminders_sent}")
+        checks.append(f"⚠️ Derniers rappels envoyés : {final_reminders_sent}")
         if pending_contact:
             alerts.append(f"{pending_contact} personne(s) impactée(s) restent à contacter")
     except Exception as exc:
@@ -319,9 +359,10 @@ async def accept_rules(c: CallbackQuery):
     async with SessionLocal() as s:
         user = await get_or_create_user(s, c.from_user)
         paid_req, link_used = await paid_access_state(s, user.id)
+        recovery = await recovery_for_user(s, user.id)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
     if paid_req:
-        await show_existing_paid_access(c.message, paid_req, link_used)
+        await show_existing_paid_access(c.message, paid_req, link_used, recovery)
         await c.answer("Votre paiement est déjà validé.", show_alert=True)
         return
     text = "Choisissez votre méthode d’accès :" if enabled else "L’accès est actuellement disponible uniquement par paiement."
@@ -333,9 +374,10 @@ async def choose_access(c: CallbackQuery):
     async with SessionLocal() as s:
         user = await get_or_create_user(s, c.from_user)
         paid_req, link_used = await paid_access_state(s, user.id)
+        recovery = await recovery_for_user(s, user.id)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
         if paid_req:
-            await show_existing_paid_access(c.message, paid_req, link_used)
+            await show_existing_paid_access(c.message, paid_req, link_used, recovery)
             await c.answer("Vous avez déjà payé : nouvelle souscription bloquée.", show_alert=True)
             return
         if method != "payment" and not enabled:
@@ -362,9 +404,10 @@ async def payment_methods_back(c: CallbackQuery):
     if not req or req.method != AccessMethod.payment.value:
         await c.answer("Aucune demande de paiement active.", show_alert=True)
         return
+    amount = payment_amount_for_reference(req.reference)
     await edit_message(
         c.message,
-        f"Le prix de l’accès est de <b>{settings.entry_price_eur} €</b>.\n"
+        f"Le prix de l’accès est de <b>{amount} €</b>.\n"
         f"Référence : <code>{escape(req.reference)}</code>\n\n"
         "Choisissez le moyen de paiement.",
         reply_markup=payment_keyboard(),
@@ -379,6 +422,10 @@ async def payment_choice(c: CallbackQuery):
     details = settings.paypal_details if method == "paypal" else settings.revolut_details
     async with SessionLocal() as s:
         user = await get_or_create_user(s, c.from_user); req = await active_request(s, user.id)
+    if not req:
+        await c.answer("Aucune demande de paiement active.", show_alert=True)
+        return
+    amount = payment_amount_for_reference(req.reference)
     extra = ""
     if method == "paypal":
         extra = (
@@ -400,7 +447,7 @@ async def payment_choice(c: CallbackQuery):
 
     await edit_message(
         c.message,
-        f"Envoyez exactement <b>{settings.entry_price_eur} €</b>.\n"
+        f"Envoyez exactement <b>{amount} €</b>.\n"
         f"Moyen : <b>{method.title()}</b>\n"
         f"Destinataire : {destination}\n"
         f"Référence obligatoire : <code>{escape(req.reference)}</code>{extra}\n\n"
@@ -477,27 +524,74 @@ async def review(c: CallbackQuery):
         req.status=AccessStatus.approved.value if decision=="ok" else AccessStatus.rejected.value
         user=await s.get(User,req.user_id); await s.commit()
         if decision=="ok":
-            await bot.send_message(user.telegram_id,"Votre demande a été validée.",reply_markup=kb([("🔗 Générer mon lien 24 h",f"invite:create:{req.id}")]))
+            if (req.reference or "").startswith("LIFETIME-"):
+                entitlement = await s.scalar(select(LifetimeMediaAccess).where(LifetimeMediaAccess.user_id == user.id))
+                if entitlement:
+                    entitlement.active = True
+                    entitlement.payment_request_id = req.id
+                else:
+                    s.add(LifetimeMediaAccess(user_id=user.id, payment_request_id=req.id, active=True))
+                await s.commit()
+                text_value = (
+                    f"✅ Votre accès permanent de {settings.lifetime_reentry_price_eur} € a été validé. "
+                    "Vous pourrez rester dans le groupe sans obligation d’envoyer des médias."
+                )
+            elif (req.reference or "").startswith(("REJOIN-", "REJOIN5-")):
+                text_value = f"✅ Votre paiement de réintégration de {settings.reentry_price_eur} € a été validé. Vous pouvez générer votre nouveau lien d’accès."
+            else:
+                text_value = "✅ Votre demande a été validée."
+            await bot.send_message(user.telegram_id, text_value, reply_markup=kb([("🔗 Générer mon lien 24 h",f"invite:create:{req.id}")]))
         else: await bot.send_message(user.telegram_id,"Votre demande a été refusée. Le paiement reste disponible depuis /start.")
     await c.message.edit_reply_markup(reply_markup=None); await c.answer("Décision enregistrée")
 
-@r.callback_query(F.data.startswith("recovery:invite:"))
-async def recovery_invite(c: CallbackQuery):
+@r.callback_query(F.data.startswith("recovery:payment:"))
+async def recovery_payment(c: CallbackQuery):
     recovery_id = int(c.data.rsplit(":", 1)[1])
     async with SessionLocal() as s:
         user = await get_or_create_user(s, c.from_user)
         recovery = await s.get(MembershipRecovery, recovery_id)
         membership = await s.get(Membership, recovery.membership_id) if recovery else None
-        if not recovery or not membership or membership.user_id != user.id or recovery.rejoined_at is not None:
-            await c.answer("Réintégration indisponible.", show_alert=True)
+        if not recovery or not membership or membership.user_id != user.id or recovery.removed_at is None:
+            await c.answer("Paiement de réintégration indisponible.", show_alert=True)
             return
-        req, _ = await paid_access_state(s, user.id)
-        if not req:
-            await c.answer("Paiement validé introuvable. Contactez un administrateur.", show_alert=True)
+        req = await active_request(s, user.id)
+        if not req or req.method != AccessMethod.payment.value or not (req.reference or "").startswith("REJOIN-"):
+            req = await create_request(s, user.id, AccessMethod.payment.value, reference_prefix="REJOIN")
+    await edit_or_send(
+        c.message,
+        f"Le prix de la réintégration est de <b>{settings.reentry_price_eur} €</b>.\n"
+        f"Référence : <code>{escape(req.reference)}</code>\n\n"
+        "Choisissez le moyen de paiement.",
+        reply_markup=payment_keyboard(),
+    )
+    await c.answer()
+
+
+@r.callback_query(F.data.startswith("recovery:lifetime:"))
+async def recovery_lifetime_payment(c: CallbackQuery):
+    recovery_id = int(c.data.rsplit(":", 1)[1])
+    async with SessionLocal() as s:
+        user = await get_or_create_user(s, c.from_user)
+        recovery = await s.get(MembershipRecovery, recovery_id)
+        membership = await s.get(Membership, recovery.membership_id) if recovery else None
+        if not recovery or not membership or membership.user_id != user.id or recovery.removed_at is None:
+            await c.answer("Paiement permanent indisponible.", show_alert=True)
             return
-        old = await s.scalar(select(Invite).where(Invite.user_id == user.id, Invite.revoked.is_(False), Invite.used_at.is_(None), Invite.expires_at > datetime.now(timezone.utc)))
-        inv = old or await create_personal_invite(bot, s, user, req)
-    await edit_or_send(c.message, f"🔁 <b>Votre retour est autorisé sans nouveau paiement.</b>\n\nLien valable 24 heures :\n{inv.invite_link}\n\nAprès votre retour, vous disposerez d’un nouveau délai pour publier votre premier média.", reply_markup=kb([("🏠 Menu", "menu")]))
+        entitlement = await s.scalar(select(LifetimeMediaAccess).where(LifetimeMediaAccess.user_id == user.id, LifetimeMediaAccess.active.is_(True)))
+        if entitlement:
+            await c.answer("Votre accès permanent est déjà actif.", show_alert=True)
+            return
+        req = await active_request(s, user.id)
+        if not req or req.method != AccessMethod.payment.value or not (req.reference or "").startswith("LIFETIME-"):
+            req = await create_request(s, user.id, AccessMethod.payment.value, reference_prefix="LIFETIME")
+    await edit_or_send(
+        c.message,
+        f"L’accès permanent coûte <b>{settings.lifetime_reentry_price_eur} €</b>.\n"
+        "Après validation, vous pourrez rester dans le groupe sans obligation d’envoyer des médias.\n"
+        f"Référence : <code>{escape(req.reference)}</code>\n\n"
+        "Choisissez le moyen de paiement.",
+        reply_markup=payment_keyboard(),
+    )
     await c.answer()
 
 
@@ -541,6 +635,10 @@ async def join_request(j: ChatJoinRequest):
                 recovery.contacted_at = None
                 recovery.last_contact_error = None
                 # Le cycle repart immédiatement; rejoined_at est seulement informatif.
+        lifetime_access = await has_lifetime_media_access(s, user.id)
+        if lifetime_access:
+            # Une date non nulle exclut ce membre des contrôles de premier média.
+            membership.first_media_at = datetime.now(timezone.utc)
         # Un dossier accepté est publié à l'entrée et compte comme première participation.
         if req.method == AccessMethod.media.value:
             files=list((await s.scalars(select(MediaSubmission).where(MediaSubmission.request_id==req.id))).all())
@@ -860,6 +958,10 @@ async def maintenance_loop():
                     for m in memberships:
                         user=await s.get(User,m.user_id); chat=await s.get(TelegramChat,m.chat_id)
                         age=now-m.joined_at
+                        if await has_lifetime_media_access(s, m.user_id):
+                            if m.first_media_at is None:
+                                m.first_media_at = now
+                            continue
                         if not m.first_media_at:
                             recovery = await s.scalar(select(MembershipRecovery).where(MembershipRecovery.membership_id == m.id))
                             if not recovery:
@@ -868,16 +970,16 @@ async def maintenance_loop():
                                 await s.flush()
                             deadline = m.joined_at + timedelta(hours=settings.first_media_hours)
                             remaining = deadline - now
-                            first_reminder_hours = max(2, min(12, settings.first_media_hours // 2))
-                            if remaining <= timedelta(hours=first_reminder_hours) and remaining > timedelta(hours=1) and recovery.reminder_24h_sent_at is None:
+                            first_reminder_hours = max(1, min(settings.first_media_reminder_hours, settings.first_media_hours))
+                            if remaining <= timedelta(hours=first_reminder_hours) and remaining > timedelta(minutes=settings.first_media_final_reminder_minutes) and recovery.reminder_24h_sent_at is None:
                                 try:
                                     await bot.send_message(user.telegram_id, f"⏳ <b>Rappel</b> : il vous reste environ {max(1, int(remaining.total_seconds() // 3600))} heure(s) pour publier votre premier média et conserver votre accès au groupe VIP.")
                                     recovery.reminder_24h_sent_at = now
                                 except Exception as exc:
                                     recovery.last_contact_error = repr(exc)[:1000]
-                            if remaining <= timedelta(hours=1) and remaining > timedelta(0) and recovery.reminder_1h_sent_at is None:
+                            if remaining <= timedelta(minutes=settings.first_media_final_reminder_minutes) and remaining > timedelta(0) and recovery.reminder_1h_sent_at is None:
                                 try:
-                                    await bot.send_message(user.telegram_id, "⚠️ <b>Dernier rappel</b> : il vous reste moins d’une heure pour publier votre premier média.")
+                                    await bot.send_message(user.telegram_id, f"⚠️ <b>Dernier rappel</b> : il vous reste moins de {settings.first_media_final_reminder_minutes} minute(s) pour publier votre premier média.")
                                     recovery.reminder_1h_sent_at = now
                                 except Exception as exc:
                                     recovery.last_contact_error = repr(exc)[:1000]
@@ -888,10 +990,12 @@ async def maintenance_loop():
                                 except Exception:
                                     logger.exception("Erreur exclusion premier média chat=%s user=%s", chat.telegram_chat_id, user.telegram_id)
                                 m.active=False
-                                recovery.removed_at = recovery.removed_at or now
+                                recovery.removed_at = now
+                                recovery.rejoined_at = None
+                                recovery.contacted_at = None
                                 recovery.contact_attempts += 1
                                 try:
-                                    await bot.send_message(user.telegram_id, "Vous avez été retiré pour absence de premier média. Votre paiement reste valide et vous pouvez revenir sans repayer.", reply_markup=kb([("🔁 Revenir dans le groupe", f"recovery:invite:{recovery.id}")]))
+                                    await bot.send_message(user.telegram_id, f"Vous avez été retiré pour absence de premier média. Vous pouvez revenir pour {settings.reentry_price_eur} €, ou choisir l’accès permanent à {settings.lifetime_reentry_price_eur} € sans obligation de média.", reply_markup=recovery_payment_keyboard(recovery.id))
                                     recovery.contacted_at = now
                                     recovery.last_contact_error = None
                                 except Exception as exc:
@@ -911,13 +1015,20 @@ async def maintenance_loop():
                             recovery = MembershipRecovery(membership_id=impacted_m.id, reason="missing_first_media", removed_at=now)
                             s.add(recovery)
                             await s.flush()
+                        elif recovery.removed_at is None:
+                            # Ancien cycle déjà terminé : cette nouvelle expulsion ouvre
+                            # un nouveau parcours payant et doit être visible dans Santé.
+                            recovery.removed_at = now
+                            recovery.rejoined_at = None
+                            recovery.contacted_at = None
+                            recovery.last_contact_error = None
                         if recovery.rejoined_at is None and recovery.contacted_at is None:
                             impacted_user = await s.get(User, impacted_m.user_id)
                             req, _ = await paid_access_state(s, impacted_user.id)
                             if req and impacted_user.started_bot:
                                 recovery.contact_attempts += 1
                                 try:
-                                    await bot.send_message(impacted_user.telegram_id, "✅ Votre paiement reste valide. Vous aviez été retiré pour absence de premier média. Vous pouvez revenir sans repayer avec le bouton ci-dessous.", reply_markup=kb([("🔁 Revenir dans le groupe", f"recovery:invite:{recovery.id}")]))
+                                    await bot.send_message(impacted_user.telegram_id, f"Vous avez été retiré pour absence de premier média. Vous pouvez revenir pour {settings.reentry_price_eur} €, ou choisir l’accès permanent à {settings.lifetime_reentry_price_eur} € sans obligation de média.", reply_markup=recovery_payment_keyboard(recovery.id))
                                     recovery.contacted_at = now
                                     recovery.last_contact_error = None
                                 except Exception as exc:
@@ -1064,9 +1175,10 @@ async def back_to_menu(c: CallbackQuery):
     async with SessionLocal() as s:
         user = await get_or_create_user(s, c.from_user)
         paid_req, link_used = await paid_access_state(s, user.id)
+        recovery = await recovery_for_user(s, user.id)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
     if paid_req:
-        await show_existing_paid_access(c.message, paid_req, link_used)
+        await show_existing_paid_access(c.message, paid_req, link_used, recovery)
         await c.answer()
         return
     await edit_message(c.message, "Choisissez votre méthode d’accès :" if enabled else "L’accès au groupe est actuellement disponible uniquement par paiement.", reply_markup=access_methods(enabled))
