@@ -16,6 +16,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telegram-vip-bot")
 settings = get_settings()
 
+DATABASE_READY = asyncio.Event()
+
 STARTUP_STATE = {
     "database": "starting",
     "webhook": "starting",
@@ -39,6 +41,7 @@ async def initialise_dependencies() -> None:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             STARTUP_STATE["database"] = "ok"
+            DATABASE_READY.set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -73,10 +76,19 @@ async def initialise_dependencies() -> None:
         delay = min(delay * 2, 60)
 
 
+async def run_maintenance_when_database_ready() -> None:
+    """Empêche toute requête de maintenance avant la création/migration du schéma."""
+    await DATABASE_READY.wait()
+    await maintenance_loop()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_task = asyncio.create_task(initialise_dependencies(), name="initialise-dependencies")
-    maintenance_task = asyncio.create_task(maintenance_loop(), name="maintenance-loop")
+    maintenance_task = asyncio.create_task(
+        run_maintenance_when_database_ready(),
+        name="maintenance-loop",
+    )
     yield
     for task in (init_task, maintenance_task):
         task.cancel()
