@@ -32,7 +32,7 @@ logger = logging.getLogger("telegram-vip-bot")
 DEFAULT_WELCOME_TEXT = "Bienvenue sur le service d’accès au groupe privé ouvert 24 h/24.\n\nVeuillez d’abord consulter les règles."
 DEFAULT_PUB_AD_TEXT = "Découvrez notre groupe privé. Utilisez le bouton ci-dessous pour commencer votre demande d’accès."
 
-RULES = """<b>Règles du groupe VIP</b>\n\n• Premier média dans les 24 heures.\n• Ensuite, au moins 5 photos ou vidéos valides toutes les 72 heures.\n• Les liens externes sont interdits.\n• Les transferts et redistributions sont interdits.\n• Les infractions entraînent 1 jour, puis 3 jours de restriction, puis un bannissement.\n• Les contenus peuvent être archivés pour restaurer un groupe de remplacement.\n\nEn cliquant sur « J’adhère », vous acceptez ces règles."""
+RULES = """<b>Règles du groupe VIP</b>\n\n• Envoyez un média dès votre arrivée.\n• Ensuite, restez actif en publiant au moins un média tous les 3 jours.\n• Les liens externes sont interdits.\n• Les transferts, captures d'écran et redistributions sont interdits.\n• Tout bannissement est définitif.\n• Le groupe reste ouvert en permanence et aucun contenu n'est supprimé.\n• Si le groupe est supprimé, vous conservez votre accès au groupe de remplacement.\n\nEn cliquant sur « J’adhère », vous acceptez ces règles."""
 
 ADMIN_STATUSES = {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
@@ -453,9 +453,7 @@ async def payment_choice(c: CallbackQuery):
     extra = ""
     if method == "paypal":
         extra = (
-            "\n\n<b>Important PayPal :</b> utilisez le type de paiement conforme proposé par PayPal pour cette transaction. "
-            "Ne classez pas volontairement un achat d’accès comme un envoi personnel afin de contourner les frais ou protections. "
-            "Un paiement non conforme pourra être refusé et transmis aux administrateurs pour examen."
+            "\n\n<b>Important PayPal :</b> Uniquement ENTRE PROCHE , si vous payez avec paypal marchand , il sera refusé et vous serez banni "
         )
     safe_details = escape(details or "Non configuré")
     raw_details = (details or "").strip()
