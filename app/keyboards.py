@@ -20,6 +20,10 @@ def payment_keyboard():
     return kb([("PayPal", "payment:paypal"), ("Revolut", "payment:revolut"), ("⬅️ Retour", "menu")])
 
 
+def payment_details_keyboard():
+    return kb([("⬅️ Retour aux moyens de paiement", "paymethods"), ("🏠 Menu principal", "menu")])
+
+
 def admin_home(options_enabled: bool, group_open: bool):
     return kb([
         (f"🔀 Options d’accès : {'ON' if options_enabled else 'OFF'}", "admin:toggle_options"),
@@ -30,6 +34,7 @@ def admin_home(options_enabled: bool, group_open: bool):
         ("📣 Configurer la publicité PUB", "admin:pub_ad"),
         ("🚀 Envoyer la publicité PUB", "admin:pub_send"),
         ("📢 Broadcast utilisateurs", "admin:broadcast"),
+        ("🛡 Modération", "mod:home"),
         ("📊 Statistiques", "admin:stats"),
         ("👥 Groupes détectés", "admin:groups"),
         ("🩺 Santé du système", "admin:health"),
