@@ -157,39 +157,3 @@ class AuditLog(Base):
     target: Mapped[str | None] = mapped_column(String(255))
     details: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
-
-class ForbiddenWord(Base):
-    __tablename__ = "forbidden_words"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    word: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-class LinkWhitelistDomain(Base):
-    __tablename__ = "link_whitelist_domains"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    domain: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-class LinkWhitelistUser(Base):
-    __tablename__ = "link_whitelist_users"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-class MediaHash(Base):
-    __tablename__ = "media_hashes"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    chat_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    user_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    message_id: Mapped[int] = mapped_column(BigInteger)
-    media_type: Mapped[str] = mapped_column(String(16), index=True)
-    sha256: Mapped[str] = mapped_column(String(64), index=True)
-    perceptual_hash: Mapped[str | None] = mapped_column(String(32), index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
-    __table_args__ = (UniqueConstraint("chat_telegram_id", "sha256", name="uq_media_hash_chat_sha256"),)
-
-class ModerationStat(Base):
-    __tablename__ = "moderation_stats"
-    key: Mapped[str] = mapped_column(String(100), primary_key=True)
-    value: Mapped[int] = mapped_column(BigInteger, default=0)
