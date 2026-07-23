@@ -96,3 +96,7 @@ Le menu **🛡 Modération** permet de gérer depuis Telegram les mots interdits
 ## Réintégration après expulsion
 
 Après une première expulsion pour absence de média, l’utilisateur choisit entre un retour classique (`REENTRY_PRICE_EUR`, 5 € par défaut) avec les obligations normales, ou un accès permanent (`LIFETIME_REENTRY_PRICE_EUR`, 10 € par défaut) sans obligation d’envoyer des médias. Chaque nouvelle expulsion classique repropose ces deux choix. Les délais sont configurables avec `FIRST_MEDIA_HOURS`, `FIRST_MEDIA_REMINDER_HOURS` et `FIRST_MEDIA_FINAL_REMINDER_MINUTES`. La nouvelle table PostgreSQL est créée automatiquement au démarrage : aucune suppression ni remise à zéro de la base existante.
+
+## Sécurité des informations administratives
+
+`ADMIN_IDS` doit contenir uniquement les identifiants Telegram numériques des propriétaires autorisés. Les preuves de paiement, dossiers médias, alertes de santé, statistiques globales et broadcasts ne sont envoyés ou accessibles qu'à ces IDs. Les administrateurs locaux d'un groupe ne disposent que des contrôles de modération liés à ce groupe et ne reçoivent aucune donnée de paiement.
