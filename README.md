@@ -88,11 +88,6 @@ Le panneau administrateur permet maintenant de configurer :
 
 Lorsqu'il est ajouté à un groupe, le bot n'envoie aucun message dans ce groupe. Il enregistre le groupe et adresse la demande de configuration uniquement en message privé aux identifiants présents dans `ADMIN_IDS`. Chaque administrateur doit avoir démarré le bot en privé au moins une fois pour recevoir ce message.
 
-## Retour après exclusion et rappels
+## Modération configurable
 
-- Un membre exclu pour absence de premier média ou activité insuffisante reçoit un bouton de retour.
-- Le retour utilise `REENTRY_PRICE_EUR` (5 € par défaut) et génère une nouvelle référence `RET-...`.
-- Après validation, un nouveau lien personnel peut être généré et les délais d'activité repartent de zéro.
-- Un rappel privé est envoyé avant l'échéance du premier média (environ 6 h avant avec les réglages par défaut).
-- Un rappel privé d'activité est envoyé avant l'échéance des 72 h (environ 12 h avant avec les réglages par défaut).
-- Les échecs d'envoi des rappels sont consignés dans les logs Railway.
+Le menu **🛡 Modération** permet de gérer depuis Telegram les mots interdits, l’anti-liens, les listes blanches, les sanctions, l’anti-repost SHA256/pHash, les messages système et les statistiques. Les tables correspondantes sont créées automatiquement dans PostgreSQL au démarrage.
