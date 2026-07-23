@@ -32,7 +32,7 @@ logger = logging.getLogger("telegram-vip-bot")
 DEFAULT_WELCOME_TEXT = "Bienvenue sur le service d’accès au groupe privé ouvert 24 h/24.\n\nVeuillez d’abord consulter les règles."
 DEFAULT_PUB_AD_TEXT = "Découvrez notre groupe privé. Utilisez le bouton ci-dessous pour commencer votre demande d’accès."
 
-RULES = """<b>Règles du groupe VIP</b>\n\n• Envoyez un média dès votre arrivée.\n• Ensuite, restez actif en publiant au moins un média tous les 3 jours.\n• Les liens externes sont interdits.\n• Les transferts, captures d'écran et redistributions sont interdits.\n• Tout bannissement est définitif.\n• Le groupe reste ouvert en permanence et aucun contenu n'est supprimé.\n• Si le groupe est supprimé, vous conservez votre accès au groupe de remplacement.\n\nEn cliquant sur « J’adhère », vous acceptez ces règles."""
+RULES = """<b>Règles du groupe VIP</b>\n\n• Premier média dans les 24 heures.\n• Ensuite, au moins 5 photos ou vidéos valides toutes les 72 heures.\n• Les liens externes sont interdits.\n• Les transferts et redistributions sont interdits.\n• Les infractions entraînent 1 jour, puis 3 jours de restriction, puis un bannissement.\n• Les contenus peuvent être archivés pour restaurer un groupe de remplacement.\n\nEn cliquant sur « J’adhère », vous acceptez ces règles."""
 
 ADMIN_STATUSES = {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
@@ -183,29 +183,39 @@ async def admin_ids_for_chat(chat_id: int) -> set[int]:
     except Exception:
         return set()
 
+def is_owner_admin(user_id: int) -> bool:
+    """Autorisation globale stricte : uniquement les IDs déclarés dans ADMIN_IDS."""
+    return user_id in settings.admin_id_set
+
 async def detected_admin_ids() -> set[int]:
-    """Administrateurs Telegram détectés dans les groupes actifs + IDs bootstrap facultatifs."""
-    ids = set(settings.admin_id_set)
-    async with SessionLocal() as s:
-        chats = list((await s.scalars(select(TelegramChat).where(TelegramChat.active.is_(True)))).all())
-    for chat in chats:
-        ids.update(await admin_ids_for_chat(chat.telegram_chat_id))
-    return ids
+    """Compatibilité interne : ne retourne volontairement que les propriétaires configurés."""
+    return set(settings.admin_id_set)
 
 async def is_admin(user_id: int, chat_id: int | None = None) -> bool:
-    if user_id in settings.admin_id_set:
+    """Les droits globaux sont réservés aux propriétaires.
+
+    Un administrateur Telegram local n'est reconnu que lorsqu'un chat_id précis est
+    fourni, afin qu'il ne puisse jamais accéder aux paiements, broadcasts ou données
+    globales depuis le bot privé.
+    """
+    if is_owner_admin(user_id):
         return True
     if chat_id is not None:
         return user_id in await admin_ids_for_chat(chat_id)
-    return user_id in await detected_admin_ids()
+    return False
 
 async def notify_admins(method: str, *args, **kwargs):
-    """Envoie aux admins détectés ayant déjà démarré le bot; ignore les DM impossibles."""
-    for admin_id in await detected_admin_ids():
+    """Envoie une information sensible uniquement aux propriétaires dans ADMIN_IDS."""
+    if not settings.admin_id_set:
+        logger.error("ADMIN_IDS est vide : notification administrateur non envoyée")
+        return
+    for admin_id in settings.admin_id_set:
         try:
             await getattr(bot, method)(admin_id, *args, **kwargs)
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            logger.warning("Notification admin impossible admin=%s: %s", admin_id, exc)
         except Exception:
-            pass
+            logger.exception("Erreur notification admin admin=%s", admin_id)
 
 
 async def build_health_report() -> tuple[str, list[str], str]:
@@ -453,7 +463,9 @@ async def payment_choice(c: CallbackQuery):
     extra = ""
     if method == "paypal":
         extra = (
-            "\n\n<b>Important PayPal :</b> Uniquement ENTRE PROCHE , si vous payez avec paypal marchand , il sera refusé et vous serez banni "
+            "\n\n<b>Important PayPal :</b> utilisez le type de paiement conforme proposé par PayPal pour cette transaction. "
+            "Ne classez pas volontairement un achat d’accès comme un envoi personnel afin de contourner les frais ou protections. "
+            "Un paiement non conforme pourra être refusé et transmis aux administrateurs pour examen."
         )
     safe_details = escape(details or "Non configuré")
     raw_details = (details or "").strip()
@@ -526,7 +538,7 @@ async def submit_media(c: CallbackQuery):
         files = list((await s.scalars(select(MediaSubmission).where(MediaSubmission.request_id == req_id))).all())
         if not req or req.user_id != (await get_or_create_user(s,c.from_user)).id or len(files)<5: await safe_callback_answer(c, "Dossier incomplet",show_alert=True); return
         req.status=AccessStatus.pending_review.value; await s.commit()
-    for aid in await detected_admin_ids():
+    for aid in settings.admin_id_set:
         try:
             await bot.send_message(aid, f"Dossier média #{req_id} — {len(files)} médias", reply_markup=kb([("✅ Accepter", f"review:media:ok:{req_id}"),("❌ Refuser", f"review:media:no:{req_id}")]))
             for f in files:
@@ -783,8 +795,8 @@ async def bot_chat_update(event: ChatMemberUpdated):
 @r.callback_query(F.data.startswith("chatrole:"))
 async def chat_role(c: CallbackQuery):
     _,role,cid=c.data.split(":"); chat_id=int(cid)
-    if not await is_admin(c.from_user.id, chat_id):
-        await safe_callback_answer(c, "Seul un administrateur de ce groupe peut choisir son rôle.", show_alert=True)
+    if not is_owner_admin(c.from_user.id):
+        await safe_callback_answer(c, "Accès réservé au propriétaire du bot.", show_alert=True)
         return
     async with SessionLocal() as s:
         if role=="vip":
@@ -877,8 +889,8 @@ async def admin_groups(c: CallbackQuery):
 @r.callback_query(F.data.startswith("admin:group:"))
 async def admin_group_detail(c: CallbackQuery):
     chat_id=int(c.data.rsplit(":",1)[1])
-    if not await is_admin(c.from_user.id, chat_id):
-        await safe_callback_answer(c, "Vous devez administrer ce groupe.", show_alert=True); return
+    if not is_owner_admin(c.from_user.id):
+        await safe_callback_answer(c, "Accès réservé au propriétaire du bot.", show_alert=True); return
     async with SessionLocal() as s:
         chat=await s.scalar(select(TelegramChat).where(TelegramChat.telegram_chat_id==chat_id))
     if not chat:
@@ -1271,6 +1283,7 @@ async def broadcast_start(c: CallbackQuery):
 
 @r.callback_query(F.data == "admin:broadcast_cancel")
 async def broadcast_cancel_button(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     BROADCAST_WAITING.discard(c.from_user.id); await render_admin_panel(c.message, edit=True); await safe_callback_answer(c, "Annulé")
 
 
@@ -1309,6 +1322,7 @@ async def moderation_words(c: CallbackQuery):
 
 @r.callback_query(F.data == "mod:words:toggle")
 async def moderation_words_toggle(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     async with SessionLocal() as s:
         cur=(await get_setting(s,"forbidden_words_enabled","0"))=="1"; await set_setting(s,"forbidden_words_enabled","0" if cur else "1")
     await moderation_words(c)
@@ -1322,6 +1336,7 @@ async def moderation_words_input(c: CallbackQuery):
 
 @r.callback_query(F.data == "mod:words:sanction")
 async def words_sanction(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     await edit_or_send(c.message,"Choisissez la sanction appliquée aux mots interdits.",reply_markup=kb([(x.title(),f"mod:set:forbidden_words_sanction:{x}") for x in ["delete","warning","mute","kick","ban"]]+[("⬅ Retour","mod:words")]))
     await safe_callback_answer(c)
 
@@ -1339,6 +1354,7 @@ async def moderation_links(c: CallbackQuery):
 
 @r.callback_query(F.data.startswith("mod:linktoggle:"))
 async def link_toggle(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     key=c.data.rsplit(":",1)[1]
     async with SessionLocal() as s:
         cur=(await get_setting(s,key,"0"))=="1"; await set_setting(s,key,"0" if cur else "1")
@@ -1346,23 +1362,27 @@ async def link_toggle(c: CallbackQuery):
 
 @r.callback_query(F.data.in_({"mod:domain:add","mod:domain:remove","mod:user:add","mod:user:remove"}))
 async def whitelist_input(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     ADMIN_INPUT_MODE[c.from_user.id]=c.data.replace("mod:","").replace(":","_")
     await edit_or_send(c.message,"Envoyez la valeur à ajouter ou supprimer. Pour un utilisateur, envoyez son ID Telegram numérique.",reply_markup=kb([("⬅ Retour","mod:links")]))
     await safe_callback_answer(c)
 
 @r.callback_query(F.data == "mod:links:sanction")
 async def links_sanction(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     await edit_or_send(c.message,"Choisissez la sanction anti-liens.",reply_markup=kb([(x.title(),f"mod:set:anti_links_sanction:{x}") for x in ["delete","warning","mute","kick","ban"]]+[("⬅ Retour","mod:links")]))
     await safe_callback_answer(c)
 
 @r.callback_query(F.data.startswith("mod:set:"))
 async def set_moderation_value(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     _,_,key,value=c.data.split(":",3)
     async with SessionLocal() as s: await set_setting(s,key,value)
     await (moderation_words(c) if key.startswith("forbidden") else moderation_links(c))
 
 @r.callback_query(F.data == "mod:repost")
 async def moderation_repost(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     async with SessionLocal() as s:
         enabled=(await get_setting(s,"anti_repost_enabled","0"))=="1"; auto=(await get_setting(s,"anti_repost_auto_delete","1"))=="1"
         count=int(await s.scalar(select(func.count(MediaHash.id))) or 0); dup=int((await s.get(ModerationStat,"reposts_detected")).value if await s.get(ModerationStat,"reposts_detected") else 0)
@@ -1371,6 +1391,7 @@ async def moderation_repost(c: CallbackQuery):
 
 @r.callback_query(F.data.in_({"mod:repost:toggle","mod:repost:delete"}))
 async def repost_toggle(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     key="anti_repost_enabled" if c.data.endswith("toggle") else "anti_repost_auto_delete"
     async with SessionLocal() as s:
         cur=(await get_setting(s,key,"0"))=="1"; await set_setting(s,key,"0" if cur else "1")
@@ -1378,24 +1399,28 @@ async def repost_toggle(c: CallbackQuery):
 
 @r.callback_query(F.data == "mod:repost:message")
 async def repost_message_input(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     ADMIN_INPUT_MODE[c.from_user.id]="anti_repost_message"
     await edit_or_send(c.message,"Envoyez le nouveau message. Utilisez {user} pour la mention.",reply_markup=kb([("⬅ Retour","mod:repost")]))
     await safe_callback_answer(c)
 
 @r.callback_query(F.data == "mod:repost:clear")
 async def repost_clear(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     async with SessionLocal() as s:
         await s.execute(__import__('sqlalchemy').delete(MediaHash)); await s.commit()
     await moderation_repost(c)
 
 @r.callback_query(F.data == "mod:system")
 async def system_toggle(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     async with SessionLocal() as s:
         cur=(await get_setting(s,"delete_system_messages","1"))=="1"; await set_setting(s,"delete_system_messages","0" if cur else "1")
     await safe_callback_answer(c, "Réglage modifié",show_alert=True); await moderation_home_screen(c.message)
 
 @r.callback_query(F.data == "mod:sanctions")
 async def sanctions_screen(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     async with SessionLocal() as s:
         fw=await get_setting(s,"forbidden_words_sanction","warning"); links=await get_setting(s,"anti_links_sanction","warning")
     await edit_or_send(c.message,f"<b>⚠️ Sanctions</b>\n\nMots interdits : <b>{fw}</b>\nAnti-liens : <b>{links}</b>\n\nMute : 1 heure.",reply_markup=kb([("🚫 Mots interdits","mod:words:sanction"),("🔗 Anti-liens","mod:links:sanction"),("⬅ Retour","mod:home")]))
@@ -1403,6 +1428,7 @@ async def sanctions_screen(c: CallbackQuery):
 
 @r.callback_query(F.data == "mod:stats")
 async def moderation_stats(c: CallbackQuery):
+    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
     async with SessionLocal() as s:
         stats={x.key:x.value for x in (await s.scalars(select(ModerationStat))).all()}; hashes=int(await s.scalar(select(func.count(MediaHash.id))) or 0)
     await edit_or_send(c.message,f"<b>📊 Statistiques modération</b>\n\nMots bloqués : <b>{stats.get('forbidden_words_blocked',0)}</b>\nLiens bloqués : <b>{stats.get('links_blocked',0)}</b>\nDoublons détectés : <b>{stats.get('reposts_detected',0)}</b>\nHash médias : <b>{hashes}</b>",reply_markup=kb([("🔄 Actualiser","mod:stats"),("⬅ Retour","mod:home"),("🏠 Menu","menu")]))
