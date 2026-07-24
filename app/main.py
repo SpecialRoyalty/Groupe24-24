@@ -11,6 +11,7 @@ from .bot import bot, dp, maintenance_loop
 from .config import get_settings
 from .db import engine, SessionLocal
 from .models import Base
+from . import runtime_state
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telegram-vip-bot")
@@ -145,6 +146,13 @@ async def telegram_webhook(
 ):
     if x_telegram_bot_api_secret_token != settings.resolved_webhook_secret:
         raise HTTPException(status_code=403, detail="invalid secret")
+
+    # La requête a atteint la bonne route avec le bon secret : le webhook est
+    # actuellement joignable, même si Telegram conserve un ancien 404 dans
+    # getWebhookInfo(). Enregistrer ce succès avant le traitement permet au
+    # callback Santé lui-même de confirmer immédiatement le rétablissement.
+    runtime_state.LAST_WEBHOOK_RECEIVED_AT = datetime.now(timezone.utc)
+
     update = Update.model_validate(await request.json(), context={"bot": bot})
     try:
         await dp.feed_update(bot, update)

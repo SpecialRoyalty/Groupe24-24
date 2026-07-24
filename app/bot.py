@@ -17,6 +17,7 @@ from .keyboards import access_methods, admin_home, kb, payment_details_keyboard,
 from .models import AccessMethod, AccessRequest, AccessStatus, ActivityMedia, Invite, MediaSubmission, Membership, PaymentProof, Referral, TelegramChat, User, ForbiddenWord, LinkWhitelistDomain, LinkWhitelistUser, MediaHash, ModerationStat, MembershipRecovery, LifetimeMediaAccess
 from .services import active_request, activity_count, create_personal_invite, create_request, get_or_create_user, get_setting, pub_chat, set_group_open, set_setting, validated_referrals, vip_chat
 from .moderation import apply_sanction, forbidden_word_hit, links_blocked, process_repost, safe_delete, stat_inc
+from . import runtime_state
 
 settings = get_settings()
 bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -262,7 +263,16 @@ async def build_health_report() -> tuple[str, list[str], str]:
             elif error_date.tzinfo is None:
                 error_date = error_date.replace(tzinfo=timezone.utc)
             error_age_seconds = max(0.0, (datetime.now(timezone.utc) - error_date).total_seconds())
-            recent_error = error_age_seconds < 300
+
+            # Une erreur Telegram n'est active que si elle est récente ET si
+            # aucune requête webhook valide n'a atteint l'application depuis.
+            # Telegram conserve souvent le dernier 404 survenu pendant un
+            # redéploiement Railway, même après plusieurs livraisons en 200.
+            recovered_after_error = (
+                runtime_state.LAST_WEBHOOK_RECEIVED_AT is not None
+                and runtime_state.LAST_WEBHOOK_RECEIVED_AT >= error_date
+            )
+            recent_error = error_age_seconds < 300 and not recovered_after_error
 
         # Une seule mise à jour peut être le callback Santé lui-même.
         # On ne déclenche une alerte que si la file commence réellement à
@@ -290,8 +300,9 @@ async def build_health_report() -> tuple[str, list[str], str]:
 
         if webhook.last_error_message and not recent_error and error_age_seconds is not None:
             logger.info(
-                "Ancienne erreur webhook ignorée dans Santé (âge=%ss): %s",
+                "Erreur webhook historique ignorée dans Santé (âge=%ss, dernier webhook reçu=%s): %s",
                 int(error_age_seconds),
+                runtime_state.LAST_WEBHOOK_RECEIVED_AT,
                 webhook.last_error_message,
             )
     except Exception as exc:
