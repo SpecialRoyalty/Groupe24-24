@@ -32,7 +32,8 @@ logger = logging.getLogger("telegram-vip-bot")
 DEFAULT_WELCOME_TEXT = "Bienvenue sur le service d’accès au groupe privé ouvert 24 h/24.\n\nVeuillez d’abord consulter les règles."
 DEFAULT_PUB_AD_TEXT = "Découvrez notre groupe privé. Utilisez le bouton ci-dessous pour commencer votre demande d’accès."
 
-RULES = """<b>Règles du groupe VIP</b>\n\n• Envoyez un média dès votre arrivée.\n• Ensuite, restez actif en publiant au moins un média tous les 3 jours.\n• Les liens externes sont interdits.\n• Les transferts, captures d'écran et redistributions sont interdits.\n• Tout bannissement est définitif.\n• Le groupe reste ouvert en permanence et aucun contenu n'est supprimé.\n• Si le groupe est supprimé, vous conservez votre accès au groupe de remplacement.\n\nEn cliquant sur « J’adhère », vous acceptez ces règles."""
+RULES = """<b>Règles du groupe VIP</b>\n\n• Premier média dans les 24 heures.\n• Ensuite, au moins 5 photos ou vidéos valides toutes les 72 heures.\n• Les liens externes sont interdits.\n• Les transferts et redistributions sont interdits.\n• Les infractions entraînent 1 jour, puis 3 jours de restriction, puis un bannissement.\n• Les contenus peuvent être archivés pour restaurer un groupe de remplacement.\n\nEn cliquant sur « J’adhère », vous acceptez ces règles."""
+
 ADMIN_STATUSES = {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
 async def edit_or_send(message: Message, text_value: str, **kwargs):
@@ -245,16 +246,54 @@ async def build_health_report() -> tuple[str, list[str], str]:
 
     try:
         webhook = await bot.get_webhook_info()
-        if webhook.url == settings.webhook_url and not webhook.last_error_message:
-            checks.append("✅ Webhook actif et sans erreur connue")
+        expected_url = settings.webhook_url.rstrip("/")
+        current_url = (webhook.url or "").rstrip("/")
+        url_ok = bool(expected_url) and current_url == expected_url
+
+        # Telegram conserve la dernière erreur historique dans getWebhookInfo,
+        # même lorsque le webhook fonctionne à nouveau. Elle ne doit être
+        # considérée comme active que si elle est récente.
+        recent_error = False
+        error_age_seconds: float | None = None
+        if webhook.last_error_message and webhook.last_error_date:
+            error_date = webhook.last_error_date
+            if isinstance(error_date, (int, float)):
+                error_date = datetime.fromtimestamp(error_date, tz=timezone.utc)
+            elif error_date.tzinfo is None:
+                error_date = error_date.replace(tzinfo=timezone.utc)
+            error_age_seconds = max(0.0, (datetime.now(timezone.utc) - error_date).total_seconds())
+            recent_error = error_age_seconds < 300
+
+        # Une seule mise à jour peut être le callback Santé lui-même.
+        # On ne déclenche une alerte que si la file commence réellement à
+        # s'accumuler.
+        pending_count = int(webhook.pending_update_count or 0)
+        pending_critical = pending_count > 5
+
+        if url_ok and not recent_error and not pending_critical:
+            checks.append("✅ Webhook Telegram actif")
         else:
             checks.append("⚠️ Webhook incorrect ou en erreur")
-            if webhook.url != settings.webhook_url:
+            if not url_ok:
                 alerts.append("URL du webhook différente de PUBLIC_BASE_URL")
-            if webhook.last_error_message:
-                alerts.append(f"Dernière erreur webhook : {webhook.last_error_message}")
-        if webhook.pending_update_count:
-            checks.append(f"⚠️ {webhook.pending_update_count} mise(s) à jour Telegram en attente")
+            if recent_error:
+                alerts.append(f"Erreur webhook récente : {webhook.last_error_message}")
+            if pending_critical:
+                alerts.append(f"{pending_count} mises à jour Telegram s'accumulent")
+
+        if pending_count == 0:
+            checks.append("✅ Aucune mise à jour Telegram en attente")
+        elif pending_count <= 5:
+            checks.append(f"ℹ️ {pending_count} mise(s) à jour Telegram en cours de traitement")
+        else:
+            checks.append(f"⚠️ {pending_count} mise(s) à jour Telegram en attente")
+
+        if webhook.last_error_message and not recent_error and error_age_seconds is not None:
+            logger.info(
+                "Ancienne erreur webhook ignorée dans Santé (âge=%ss): %s",
+                int(error_age_seconds),
+                webhook.last_error_message,
+            )
     except Exception as exc:
         checks.append("❌ Impossible de lire l’état du webhook")
         alerts.append(f"Webhook : {type(exc).__name__}")
@@ -462,8 +501,9 @@ async def payment_choice(c: CallbackQuery):
     extra = ""
     if method == "paypal":
         extra = (
-            "\n\n<b>Important PayPal :</b> Uniquement paypal ENTRE PROCHE seront acceptés. "
-
+            "\n\n<b>Important PayPal :</b> utilisez le type de paiement conforme proposé par PayPal pour cette transaction. "
+            "Ne classez pas volontairement un achat d’accès comme un envoi personnel afin de contourner les frais ou protections. "
+            "Un paiement non conforme pourra être refusé et transmis aux administrateurs pour examen."
         )
     safe_details = escape(details or "Non configuré")
     raw_details = (details or "").strip()
