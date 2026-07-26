@@ -14,11 +14,14 @@ class Settings(BaseSettings):
     revolut_details: str = ""
     entry_price_eur: int = 2
     reentry_price_eur: int = 5
+    lifetime_reentry_price_eur: int = 10
     referral_target: int = 20
     referral_window_hours: int = 48
     referral_validation_minutes: int = 5
     invite_ttl_hours: int = 24
     first_media_hours: int = 24
+    first_media_reminder_hours: int = 12
+    first_media_final_reminder_minutes: int = 60
     activity_window_hours: int = 72
     activity_media_target: int = 5
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
@@ -55,7 +58,8 @@ class Settings(BaseSettings):
     def resolved_webhook_secret(self) -> str:
         value = self.webhook_secret.strip()
         if value:
-            return value
+            cleaned = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in value)
+            return cleaned[:256]
         # Secret stable et compatible Telegram, sans exposer le token.
         return hashlib.sha256(self.bot_token.encode()).hexdigest()[:48]
 

@@ -42,6 +42,7 @@ class User(Base):
     last_name: Mapped[str] = mapped_column(String(128), default="")
     started_bot: Mapped[bool] = mapped_column(Boolean, default=False)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+    has_lifetime_reentry: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -127,6 +128,7 @@ class Membership(Base):
     first_media_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     warned_first_day: Mapped[bool] = mapped_column(Boolean, default=False)
+    warned_first_final: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     warned_activity: Mapped[bool] = mapped_column(Boolean, default=False)
     __table_args__ = (UniqueConstraint("user_id", "chat_id", name="uq_membership_user_chat"),)
 

@@ -7,7 +7,7 @@ from aiogram.types import Update
 from fastapi import FastAPI, Header, HTTPException, Request
 from sqlalchemy import text
 
-from .bot import bot, dp, maintenance_loop
+from .bot import bot, dp, maintenance_loop, startup_membership_audit
 from .config import get_settings
 from .db import engine, SessionLocal
 from .models import Base
@@ -38,6 +38,9 @@ async def initialise_dependencies() -> None:
         try:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
+                # Migrations légères et idempotentes pour les bases Railway existantes.
+                await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS has_lifetime_reentry BOOLEAN NOT NULL DEFAULT FALSE"))
+                await conn.execute(text("ALTER TABLE memberships ADD COLUMN IF NOT EXISTS warned_first_final BOOLEAN NOT NULL DEFAULT FALSE"))
             STARTUP_STATE["database"] = "ok"
         except asyncio.CancelledError:
             raise
@@ -67,6 +70,10 @@ async def initialise_dependencies() -> None:
         STARTUP_STATE["last_error"] = " | ".join(errors) if errors else None
         if not errors:
             logger.info("PostgreSQL et webhook Telegram initialisés")
+            try:
+                await startup_membership_audit()
+            except Exception:
+                logger.exception("Audit de réparation au démarrage impossible")
             return
 
         await asyncio.sleep(delay)
