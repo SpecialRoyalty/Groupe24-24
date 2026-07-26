@@ -6,6 +6,3 @@ asyncpg>=0.29,<1
 pydantic-settings>=2.5,<3
 python-multipart>=0.0.9,<1
 alembic>=1.13,<2
-
-Pillow>=10,<12
-ImageHash>=4.3,<5

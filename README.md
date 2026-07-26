@@ -88,15 +88,19 @@ Le panneau administrateur permet maintenant de configurer :
 
 Lorsqu'il est ajouté à un groupe, le bot n'envoie aucun message dans ce groupe. Il enregistre le groupe et adresse la demande de configuration uniquement en message privé aux identifiants présents dans `ADMIN_IDS`. Chaque administrateur doit avoir démarré le bot en privé au moins une fois pour recevoir ce message.
 
-## Modération configurable
+## Retour après exclusion et rappels
 
-Le menu **🛡 Modération** permet de gérer depuis Telegram les mots interdits, l’anti-liens, les listes blanches, les sanctions, l’anti-repost SHA256/pHash, les messages système et les statistiques. Les tables correspondantes sont créées automatiquement dans PostgreSQL au démarrage.
+- Un membre exclu pour absence de premier média ou activité insuffisante reçoit un bouton de retour.
+- Le retour utilise `REENTRY_PRICE_EUR` (5 € par défaut) et génère une nouvelle référence `RET-...`.
+- Après validation, un nouveau lien personnel peut être généré et les délais d'activité repartent de zéro.
+- Un rappel privé est envoyé avant l'échéance du premier média (environ 6 h avant avec les réglages par défaut).
+- Un rappel privé d'activité est envoyé avant l'échéance des 72 h (environ 12 h avant avec les réglages par défaut).
+- Les échecs d'envoi des rappels sont consignés dans les logs Railway.
 
 
-## Réintégration après expulsion
+## Retour Lifetime et audit automatique
 
-Après une première expulsion pour absence de média, l’utilisateur choisit entre un retour classique (`REENTRY_PRICE_EUR`, 5 € par défaut) avec les obligations normales, ou un accès permanent (`LIFETIME_REENTRY_PRICE_EUR`, 10 € par défaut) sans obligation d’envoyer des médias. Chaque nouvelle expulsion classique repropose ces deux choix. Les délais sont configurables avec `FIRST_MEDIA_HOURS`, `FIRST_MEDIA_REMINDER_HOURS` et `FIRST_MEDIA_FINAL_REMINDER_MINUTES`. La nouvelle table PostgreSQL est créée automatiquement au démarrage : aucune suppression ni remise à zéro de la base existante.
-
-## Sécurité des informations administratives
-
-`ADMIN_IDS` doit contenir uniquement les identifiants Telegram numériques des propriétaires autorisés. Les preuves de paiement, dossiers médias, alertes de santé, statistiques globales et broadcasts ne sont envoyés ou accessibles qu'à ces IDs. Les administrateurs locaux d'un groupe ne disposent que des contrôles de modération liés à ce groupe et ne reçoivent aucune donnée de paiement.
+- `LIFETIME_PRICE_EUR` définit le prix de l’option Lifetime (25 € par défaut).
+- Un membre Lifetime retiré pour inactivité peut demander un nouveau lien sans repayer. Les obligations de participation restent applicables.
+- À chaque démarrage réussi, le bot compare PostgreSQL au statut Telegram, corrige les anciens membres marqués actifs à tort, contacte une seule fois les personnes concernées et envoie un bilan aux identifiants de `ADMIN_IDS`.
+- Les utilisateurs doivent avoir déjà lancé le bot en privé pour pouvoir être contactés.
