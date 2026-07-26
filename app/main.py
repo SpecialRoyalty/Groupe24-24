@@ -7,7 +7,7 @@ from aiogram.types import Update
 from fastapi import FastAPI, Header, HTTPException, Request
 from sqlalchemy import text
 
-from .bot import bot, dp, maintenance_loop, startup_membership_audit
+from .bot import bot, dp, maintenance_loop
 from .config import get_settings
 from .db import engine, SessionLocal
 from .models import Base
@@ -67,11 +67,6 @@ async def initialise_dependencies() -> None:
         STARTUP_STATE["last_error"] = " | ".join(errors) if errors else None
         if not errors:
             logger.info("PostgreSQL et webhook Telegram initialisés")
-            try:
-                stats = await startup_membership_audit()
-                logger.info("Audit membres terminé: %s", stats)
-            except Exception:
-                logger.exception("Audit automatique des membres impossible")
             return
 
         await asyncio.sleep(delay)

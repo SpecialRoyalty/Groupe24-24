@@ -175,90 +175,6 @@ async def automatic_health_alerts() -> None:
         await notify_admins("send_message", "<b>✅ Santé rétablie</b>\n\nTous les contrôles essentiels sont revenus à la normale.")
     LAST_HEALTH_SIGNATURE = signature
 
-async def is_lifetime_user(session, user_id: int) -> bool:
-    return (await get_setting(session, f"lifetime_user:{user_id}", "0")) == "1"
-
-
-async def reentry_buttons(session, user_id: int):
-    if await is_lifetime_user(session, user_id):
-        return [("♾ Réactiver mon accès Lifetime", "reentry:lifetime_free"), ("📜 Consulter les règles", "rules:show")]
-    return [
-        (f"🔄 Demander mon retour — {settings.reentry_price_eur} €", "reentry:start"),
-        (f"♾ Retour Lifetime — {settings.lifetime_price_eur} €", "reentry:lifetime"),
-        ("📜 Consulter les règles", "rules:show"),
-    ]
-
-
-async def startup_membership_audit() -> dict[str, int]:
-    """Répare les incohérences historiques et contacte une seule fois les membres concernés."""
-    stats = {"scanned": 0, "corrected": 0, "eligible": 0, "contacted": 0, "failed": 0, "already_notified": 0}
-    async with SessionLocal() as session:
-        vip = await vip_chat(session)
-        if not vip:
-            for admin_id in settings.admin_id_set:
-                with suppress(Exception):
-                    await bot.send_message(admin_id, "⚠️ Audit de démarrage impossible : aucun groupe VIP n’est configuré.")
-            return stats
-        rows = list((await session.execute(
-            select(Membership, User).join(User, Membership.user_id == User.id).where(Membership.chat_id == vip.id)
-        )).all())
-        for membership, user in rows:
-            stats["scanned"] += 1
-            if membership.active:
-                try:
-                    actual = await bot.get_chat_member(vip.telegram_chat_id, user.telegram_id)
-                    telegram_active = actual.status in {
-                        ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED,
-                        ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR,
-                    }
-                    if not telegram_active:
-                        membership.active = False
-                        stats["corrected"] += 1
-                except Exception:
-                    continue
-            if not membership.active and user.started_bot:
-                stats["eligible"] += 1
-                notification_key = f"reentry_audit_notified:{user.id}"
-                if (await get_setting(session, notification_key, "0")) == "1":
-                    stats["already_notified"] += 1
-                    continue
-                lifetime = await is_lifetime_user(session, user.id)
-                if lifetime:
-                    text = (
-                        "♾ <b>Votre accès Lifetime peut être réactivé</b>\n\n"
-                        "Une ancienne incohérence de statut a été détectée et corrigée. "
-                        "Vous pouvez générer un nouvel accès sans effectuer de nouveau paiement."
-                    )
-                else:
-                    text = (
-                        "🔄 <b>Votre retour est disponible</b>\n\n"
-                        "Votre ancien statut a été vérifié après une mise à jour du bot. "
-                        f"Vous pouvez revenir pour <b>{settings.reentry_price_eur} €</b> ou choisir "
-                        f"l’option <b>Lifetime à {settings.lifetime_price_eur} €</b>."
-                    )
-                try:
-                    await bot.send_message(user.telegram_id, text, reply_markup=kb(await reentry_buttons(session, user.id)))
-                    await set_setting(session, notification_key, "1")
-                    stats["contacted"] += 1
-                except Exception:
-                    stats["failed"] += 1
-        await session.commit()
-
-    report = (
-        "<b>🧰 Bilan de réparation au démarrage</b>\n\n"
-        f"Membres vérifiés : <b>{stats['scanned']}</b>\n"
-        f"Statuts corrigés : <b>{stats['corrected']}</b>\n"
-        f"Personnes éligibles au retour : <b>{stats['eligible']}</b>\n"
-        f"Personnes contactées : <b>{stats['contacted']}</b>\n"
-        f"Déjà contactées auparavant : <b>{stats['already_notified']}</b>\n"
-        f"Contacts impossibles : <b>{stats['failed']}</b>"
-    )
-    for admin_id in settings.admin_id_set:
-        with suppress(Exception):
-            await bot.send_message(admin_id, report)
-    return stats
-
-
 async def reconcile_vip_membership(session, user: User) -> Membership | None:
     """Réconcilie l’état local avec le statut réel Telegram.
 
@@ -310,8 +226,7 @@ async def start(message: Message):
             .order_by(Membership.id.desc())
         )
     if previous_membership:
-        async with SessionLocal() as s:
-            rows = await reentry_buttons(s, user.id)
+        rows = [(f"🔄 Demander mon retour — {settings.reentry_price_eur} €", "reentry:start"), ("📜 Consulter les règles", "rules:show")]
     else:
         rows = [("📜 Consulter les règles", "rules:show")]
     if await is_admin(message.from_user.id):
@@ -351,57 +266,6 @@ async def reentry_start(c: CallbackQuery):
         reply_markup=payment_keyboard(),
     )
     await c.answer()
-
-@r.callback_query(F.data == "reentry:lifetime")
-async def reentry_lifetime(c: CallbackQuery):
-    async with SessionLocal() as s:
-        user = await get_or_create_user(s, c.from_user)
-        previous_membership = await s.scalar(
-            select(Membership).join(TelegramChat, Membership.chat_id == TelegramChat.id)
-            .where(Membership.user_id == user.id, TelegramChat.role == "vip", Membership.active.is_(False))
-            .order_by(Membership.id.desc())
-        )
-        if not previous_membership:
-            await c.answer("Aucune exclusion donnant droit à un retour n’a été trouvée.", show_alert=True)
-            return
-        req = await create_request(s, user.id, AccessMethod.payment.value)
-        req.reference = f"LIFE-{req.reference.removeprefix('VIP-')}"
-        await s.commit()
-    await c.message.edit_text(
-        f"<b>Retour Lifetime</b>\n\nMontant : <b>{settings.lifetime_price_eur} €</b>\n"
-        "Après validation, vos futurs retours ne nécessiteront plus de nouveau paiement. "
-        "Les règles de participation du groupe restent applicables.\n"
-        f"Référence : <code>{req.reference}</code>\n\nChoisissez votre moyen de paiement.",
-        reply_markup=payment_keyboard(),
-    )
-    await c.answer()
-
-
-@r.callback_query(F.data == "reentry:lifetime_free")
-async def reentry_lifetime_free(c: CallbackQuery):
-    async with SessionLocal() as s:
-        user = await get_or_create_user(s, c.from_user)
-        if not await is_lifetime_user(s, user.id):
-            await c.answer("Aucun droit Lifetime actif n’a été trouvé.", show_alert=True)
-            return
-        previous_membership = await s.scalar(
-            select(Membership).join(TelegramChat, Membership.chat_id == TelegramChat.id)
-            .where(Membership.user_id == user.id, TelegramChat.role == "vip", Membership.active.is_(False))
-            .order_by(Membership.id.desc())
-        )
-        if not previous_membership:
-            await c.answer("Votre accès ne nécessite pas de réactivation.", show_alert=True)
-            return
-        req = await create_request(s, user.id, AccessMethod.payment.value)
-        req.reference = f"LIFEFREE-{req.reference.removeprefix('VIP-')}"
-        req.status = AccessStatus.approved.value
-        await s.commit()
-    await c.message.edit_text(
-        "♾ <b>Réactivation Lifetime autorisée</b>\n\nVous pouvez générer un nouveau lien personnel valable 24 heures.",
-        reply_markup=kb([("🔗 Générer mon lien 24 h", f"invite:create:{req.id}")]),
-    )
-    await c.answer()
-
 
 @r.callback_query(F.data == "rules:show")
 async def show_rules(c: CallbackQuery):
@@ -445,9 +309,7 @@ async def payment_choice(c: CallbackQuery):
         user = await get_or_create_user(s, c.from_user); req = await active_request(s, user.id)
     if not req:
         await c.answer("Aucune demande de paiement active.", show_alert=True); return
-    price = (settings.lifetime_price_eur if (req.reference or "").startswith("LIFE-")
-             else settings.reentry_price_eur if (req.reference or "").startswith("RET-")
-             else settings.entry_price_eur)
+    price = settings.reentry_price_eur if (req.reference or "").startswith("RET-") else settings.entry_price_eur
     extra = ""
     if method == "paypal":
         extra = (
@@ -473,9 +335,7 @@ async def private_photo(message: Message):
         if req.method == AccessMethod.payment.value:
             proof = PaymentProof(request_id=req.id, file_id=message.photo[-1].file_id, payment_method="manual")
             req.status = AccessStatus.pending_review.value; s.add(proof); await s.commit()
-            expected_price = (settings.lifetime_price_eur if (req.reference or "").startswith("LIFE-")
-             else settings.reentry_price_eur if (req.reference or "").startswith("RET-")
-             else settings.entry_price_eur)
+            expected_price = settings.reentry_price_eur if (req.reference or "").startswith("RET-") else settings.entry_price_eur
             cap = f"Paiement à vérifier\nUtilisateur : {message.from_user.full_name} (@{message.from_user.username or '-'})\nID : <code>{message.from_user.id}</code>\nRéférence : <code>{req.reference}</code>\nMontant attendu : <b>{expected_price} €</b>"
             markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Valider", callback_data=f"review:pay:ok:{req.id}"),InlineKeyboardButton(text="❌ Refuser", callback_data=f"review:pay:no:{req.id}")]])
             await notify_admins("send_photo", proof.file_id, caption=cap, reply_markup=markup)
@@ -525,10 +385,7 @@ async def review(c: CallbackQuery):
         req=await s.get(AccessRequest,req_id)
         if not req: return
         req.status=AccessStatus.approved.value if decision=="ok" else AccessStatus.rejected.value
-        user=await s.get(User,req.user_id)
-        if decision == "ok" and (req.reference or "").startswith("LIFE-"):
-            await set_setting(s, f"lifetime_user:{user.id}", "1")
-        await s.commit()
+        user=await s.get(User,req.user_id); await s.commit()
         if decision=="ok":
             await bot.send_message(user.telegram_id,"Votre demande a été validée.",reply_markup=kb([("🔗 Générer mon lien 24 h",f"invite:create:{req.id}")]))
         else: await bot.send_message(user.telegram_id,"Votre demande a été refusée. Le paiement reste disponible depuis /start.")
@@ -837,11 +694,7 @@ async def maintenance_loop():
                                     user.telegram_id,
                                     "❌ <b>Accès retiré</b>\n\nVotre accès a été retiré parce qu’aucun premier média valide n’a été publié dans le délai prévu. "
                                     f"Vous pouvez demander à revenir avec une participation de <b>{settings.reentry_price_eur} €</b>.",
-                                    reply_markup=kb([
-                                        (f"🔄 Demander mon retour — {settings.reentry_price_eur} €", "reentry:start"),
-                                        (f"♾ Retour Lifetime — {settings.lifetime_price_eur} €", "reentry:lifetime"),
-                                        ("📜 Consulter les règles", "rules:show"),
-                                    ]),
+                                    reply_markup=kb([(f"🔄 Demander mon retour — {settings.reentry_price_eur} €", "reentry:start"), ("📜 Consulter les règles", "rules:show")]),
                                 )
                             except Exception as exc:
                                 print("first media exclusion notification error", user.telegram_id, repr(exc))
@@ -870,11 +723,7 @@ async def maintenance_loop():
                                         user.telegram_id,
                                         f"❌ <b>Accès retiré pour inactivité</b>\n\nSeulement <b>{count}/{settings.activity_media_target}</b> médias ont été comptabilisés. "
                                         f"Vous pouvez demander à revenir avec une participation de <b>{settings.reentry_price_eur} €</b>.",
-                                        reply_markup=kb([
-                                        (f"🔄 Demander mon retour — {settings.reentry_price_eur} €", "reentry:start"),
-                                        (f"♾ Retour Lifetime — {settings.lifetime_price_eur} €", "reentry:lifetime"),
-                                        ("📜 Consulter les règles", "rules:show"),
-                                    ]),
+                                        reply_markup=kb([(f"🔄 Demander mon retour — {settings.reentry_price_eur} €", "reentry:start"), ("📜 Consulter les règles", "rules:show")]),
                                     )
                                 except Exception as exc:
                                     print("activity exclusion notification error", user.telegram_id, repr(exc))
