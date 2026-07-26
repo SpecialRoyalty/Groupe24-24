@@ -7,17 +7,14 @@ from aiogram.types import Update
 from fastapi import FastAPI, Header, HTTPException, Request
 from sqlalchemy import text
 
-from .bot import bot, dp, maintenance_loop
+from .bot import bot, dp, maintenance_loop, startup_membership_audit
 from .config import get_settings
 from .db import engine, SessionLocal
 from .models import Base
-from . import runtime_state
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telegram-vip-bot")
 settings = get_settings()
-
-DATABASE_READY = asyncio.Event()
 
 STARTUP_STATE = {
     "database": "starting",
@@ -42,7 +39,6 @@ async def initialise_dependencies() -> None:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             STARTUP_STATE["database"] = "ok"
-            DATABASE_READY.set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -71,25 +67,21 @@ async def initialise_dependencies() -> None:
         STARTUP_STATE["last_error"] = " | ".join(errors) if errors else None
         if not errors:
             logger.info("PostgreSQL et webhook Telegram initialisés")
+            try:
+                stats = await startup_membership_audit()
+                logger.info("Audit membres terminé: %s", stats)
+            except Exception:
+                logger.exception("Audit automatique des membres impossible")
             return
 
         await asyncio.sleep(delay)
         delay = min(delay * 2, 60)
 
 
-async def run_maintenance_when_database_ready() -> None:
-    """Empêche toute requête de maintenance avant la création/migration du schéma."""
-    await DATABASE_READY.wait()
-    await maintenance_loop()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_task = asyncio.create_task(initialise_dependencies(), name="initialise-dependencies")
-    maintenance_task = asyncio.create_task(
-        run_maintenance_when_database_ready(),
-        name="maintenance-loop",
-    )
+    maintenance_task = asyncio.create_task(maintenance_loop(), name="maintenance-loop")
     yield
     for task in (init_task, maintenance_task):
         task.cancel()
@@ -146,13 +138,6 @@ async def telegram_webhook(
 ):
     if x_telegram_bot_api_secret_token != settings.resolved_webhook_secret:
         raise HTTPException(status_code=403, detail="invalid secret")
-
-    # La requête a atteint la bonne route avec le bon secret : le webhook est
-    # actuellement joignable, même si Telegram conserve un ancien 404 dans
-    # getWebhookInfo(). Enregistrer ce succès avant le traitement permet au
-    # callback Santé lui-même de confirmer immédiatement le rétablissement.
-    runtime_state.LAST_WEBHOOK_RECEIVED_AT = datetime.now(timezone.utc)
-
     update = Update.model_validate(await request.json(), context={"bot": bot})
     try:
         await dp.feed_update(bot, update)

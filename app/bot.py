@@ -1,23 +1,18 @@
 from __future__ import annotations
 import asyncio
-import logging
-from html import escape
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ParseMode
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, ChatJoinRequest, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select, func, text
 from .config import get_settings
 from .db import SessionLocal
-from .keyboards import access_methods, admin_home, kb, payment_details_keyboard, payment_keyboard, rules_keyboard
-from .models import AccessMethod, AccessRequest, AccessStatus, ActivityMedia, Invite, MediaSubmission, Membership, PaymentProof, Referral, TelegramChat, User, ForbiddenWord, LinkWhitelistDomain, LinkWhitelistUser, MediaHash, ModerationStat, MembershipRecovery, LifetimeMediaAccess
+from .keyboards import access_methods, admin_home, kb, payment_keyboard, rules_keyboard
+from .models import AccessMethod, AccessRequest, AccessStatus, ActivityMedia, Invite, MediaSubmission, Membership, PaymentProof, Referral, TelegramChat, User
 from .services import active_request, activity_count, create_personal_invite, create_request, get_or_create_user, get_setting, pub_chat, set_group_open, set_setting, validated_referrals, vip_chat
-from .moderation import apply_sanction, forbidden_word_hit, links_blocked, process_repost, safe_delete, stat_inc
-from . import runtime_state
 
 settings = get_settings()
 bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -28,7 +23,6 @@ LAST_MAINTENANCE_AT: datetime | None = None
 LAST_MAINTENANCE_ERROR: str | None = None
 LAST_HEALTH_SIGNATURE: str | None = None
 ADMIN_INPUT_MODE: dict[int, str] = {}
-logger = logging.getLogger("telegram-vip-bot")
 
 DEFAULT_WELCOME_TEXT = "Bienvenue sur le service d’accès au groupe privé ouvert 24 h/24.\n\nVeuillez d’abord consulter les règles."
 DEFAULT_PUB_AD_TEXT = "Découvrez notre groupe privé. Utilisez le bouton ci-dessous pour commencer votre demande d’accès."
@@ -37,146 +31,6 @@ RULES = """<b>Règles du groupe VIP</b>\n\n• Premier média dans les 24 heures
 
 ADMIN_STATUSES = {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
-async def edit_or_send(message: Message, text_value: str, **kwargs):
-    """Édite texte/légende quand possible, sinon envoie un nouveau message sans planter."""
-    try:
-        if message.photo or message.video or message.animation or message.document or message.caption is not None:
-            return await message.edit_caption(caption=text_value, **kwargs)
-        if message.text is not None:
-            return await message.edit_text(text_value, **kwargs)
-        return await message.answer(text_value, **kwargs)
-    except TelegramBadRequest as exc:
-        error = str(exc).lower()
-        handled = (
-            "message can't be edited",
-            "message is not modified",
-            "there is no text in the message",
-            "message to edit not found",
-        )
-        logger.warning("Erreur Telegram édition: %s", exc)
-        if "message is not modified" in error:
-            return message
-        if any(item in error for item in handled):
-            return await message.answer(text_value, **kwargs)
-        try:
-            return await message.answer(text_value, **kwargs)
-        except Exception:
-            logger.exception("Erreur Telegram lors du fallback answer")
-            return message
-    except Exception:
-        logger.exception("Erreur Telegram edit_or_send")
-        try:
-            return await message.answer(text_value, **kwargs)
-        except Exception:
-            logger.exception("Erreur Telegram answer finale")
-            return message
-
-edit_message = edit_or_send
-
-
-async def safe_callback_answer(callback: CallbackQuery, text: str | None = None, **kwargs):
-    """Acquitte un callback sans faire échouer le webhook s'il a expiré."""
-    try:
-        return await callback.answer(text=text, **kwargs)
-    except TelegramBadRequest as exc:
-        error = str(exc).lower()
-        if (
-            "query is too old" in error
-            or "response timeout expired" in error
-            or "query id is invalid" in error
-        ):
-            logger.info(
-                "Callback Telegram expiré ignoré user=%s data=%s",
-                callback.from_user.id if callback.from_user else None,
-                callback.data,
-            )
-            return None
-        logger.warning("Erreur Telegram callback.answer: %s", exc)
-        return None
-    except Exception:
-        logger.exception("Erreur inattendue callback.answer")
-        return None
-
-async def paid_access_state(session, user_id: int):
-    """Retourne la dernière demande payée validée et indique si son lien a déjà été utilisé."""
-    req = await session.scalar(
-        select(AccessRequest)
-        .where(
-            AccessRequest.user_id == user_id,
-            AccessRequest.method == AccessMethod.payment.value,
-            AccessRequest.status.in_([AccessStatus.approved.value, AccessStatus.member.value]),
-        )
-        .order_by(AccessRequest.id.desc())
-    )
-    if not req:
-        return None, False
-    used_invite = await session.scalar(
-        select(Invite).where(Invite.request_id == req.id, Invite.used_at.is_not(None)).order_by(Invite.id.desc())
-    )
-    return req, bool(used_invite or req.status == AccessStatus.member.value)
-
-async def recovery_for_user(session, user_id: int) -> MembershipRecovery | None:
-    return await session.scalar(
-        select(MembershipRecovery)
-        .join(Membership, MembershipRecovery.membership_id == Membership.id)
-        .where(
-            Membership.user_id == user_id,
-            Membership.active.is_(False),
-            MembershipRecovery.removed_at.is_not(None),
-            MembershipRecovery.rejoined_at.is_(None),
-        )
-        .order_by(MembershipRecovery.removed_at.desc())
-    )
-
-
-async def has_lifetime_media_access(session, user_id: int) -> bool:
-    return bool(await session.scalar(
-        select(LifetimeMediaAccess.id).where(
-            LifetimeMediaAccess.user_id == user_id,
-            LifetimeMediaAccess.active.is_(True),
-        )
-    ))
-
-
-def payment_amount_for_reference(reference: str | None) -> int:
-    ref = reference or ""
-    if ref.startswith("LIFETIME-"):
-        return settings.lifetime_reentry_price_eur
-    if ref.startswith(("REJOIN-", "REJOIN5-")):
-        return settings.reentry_price_eur
-    return settings.entry_price_eur
-
-
-def recovery_payment_keyboard(recovery_id: int):
-    return kb([
-        (f"💳 Revenir pour {settings.reentry_price_eur} €", f"recovery:payment:{recovery_id}"),
-        (f"♾ Revenir à vie pour {settings.lifetime_reentry_price_eur} €", f"recovery:lifetime:{recovery_id}"),
-        ("🏠 Menu", "menu"),
-    ])
-
-
-async def show_existing_paid_access(message: Message, req: AccessRequest, link_used: bool, recovery: MembershipRecovery | None = None):
-    if recovery:
-        await message.answer(
-            "⚠️ <b>Vous avez été retiré du groupe.</b>\n\n"
-            "Aucun premier média n’a été publié dans le délai prévu. "
-            f"Vous pouvez revenir pour <b>{settings.reentry_price_eur} €</b> avec le parcours normal, "
-            f"ou choisir l’accès permanent à <b>{settings.lifetime_reentry_price_eur} €</b> sans obligation d’envoyer des médias. "
-            "Après un retour classique, les rappels et l’expulsion automatique restent actifs.",
-            reply_markup=recovery_payment_keyboard(recovery.id),
-        )
-    elif link_used:
-        await message.answer(
-            "✅ <b>Vous êtes déjà membre VIP.</b>",
-            reply_markup=kb([("🏠 Menu", "menu")]),
-        )
-    else:
-        await message.answer(
-            "✅ <b>Votre paiement a déjà été validé.</b>\n\n"
-            "Vous ne pouvez pas effectuer une nouvelle souscription. Utilisez votre accès déjà approuvé.",
-            reply_markup=kb([("🔗 Générer mon lien 24 h", f"invite:create:{req.id}"), ("🏠 Menu", "menu")]),
-        )
-
 async def admin_ids_for_chat(chat_id: int) -> set[int]:
     try:
         admins = await bot.get_chat_administrators(chat_id)
@@ -184,39 +38,29 @@ async def admin_ids_for_chat(chat_id: int) -> set[int]:
     except Exception:
         return set()
 
-def is_owner_admin(user_id: int) -> bool:
-    """Autorisation globale stricte : uniquement les IDs déclarés dans ADMIN_IDS."""
-    return user_id in settings.admin_id_set
-
 async def detected_admin_ids() -> set[int]:
-    """Compatibilité interne : ne retourne volontairement que les propriétaires configurés."""
-    return set(settings.admin_id_set)
+    """Administrateurs Telegram détectés dans les groupes actifs + IDs bootstrap facultatifs."""
+    ids = set(settings.admin_id_set)
+    async with SessionLocal() as s:
+        chats = list((await s.scalars(select(TelegramChat).where(TelegramChat.active.is_(True)))).all())
+    for chat in chats:
+        ids.update(await admin_ids_for_chat(chat.telegram_chat_id))
+    return ids
 
 async def is_admin(user_id: int, chat_id: int | None = None) -> bool:
-    """Les droits globaux sont réservés aux propriétaires.
-
-    Un administrateur Telegram local n'est reconnu que lorsqu'un chat_id précis est
-    fourni, afin qu'il ne puisse jamais accéder aux paiements, broadcasts ou données
-    globales depuis le bot privé.
-    """
-    if is_owner_admin(user_id):
+    if user_id in settings.admin_id_set:
         return True
     if chat_id is not None:
         return user_id in await admin_ids_for_chat(chat_id)
-    return False
+    return user_id in await detected_admin_ids()
 
 async def notify_admins(method: str, *args, **kwargs):
-    """Envoie une information sensible uniquement aux propriétaires dans ADMIN_IDS."""
-    if not settings.admin_id_set:
-        logger.error("ADMIN_IDS est vide : notification administrateur non envoyée")
-        return
-    for admin_id in settings.admin_id_set:
+    """Envoie aux admins détectés ayant déjà démarré le bot; ignore les DM impossibles."""
+    for admin_id in await detected_admin_ids():
         try:
             await getattr(bot, method)(admin_id, *args, **kwargs)
-        except (TelegramBadRequest, TelegramForbiddenError) as exc:
-            logger.warning("Notification admin impossible admin=%s: %s", admin_id, exc)
         except Exception:
-            logger.exception("Erreur notification admin admin=%s", admin_id)
+            pass
 
 
 async def build_health_report() -> tuple[str, list[str], str]:
@@ -247,64 +91,16 @@ async def build_health_report() -> tuple[str, list[str], str]:
 
     try:
         webhook = await bot.get_webhook_info()
-        expected_url = settings.webhook_url.rstrip("/")
-        current_url = (webhook.url or "").rstrip("/")
-        url_ok = bool(expected_url) and current_url == expected_url
-
-        # Telegram conserve la dernière erreur historique dans getWebhookInfo,
-        # même lorsque le webhook fonctionne à nouveau. Elle ne doit être
-        # considérée comme active que si elle est récente.
-        recent_error = False
-        error_age_seconds: float | None = None
-        if webhook.last_error_message and webhook.last_error_date:
-            error_date = webhook.last_error_date
-            if isinstance(error_date, (int, float)):
-                error_date = datetime.fromtimestamp(error_date, tz=timezone.utc)
-            elif error_date.tzinfo is None:
-                error_date = error_date.replace(tzinfo=timezone.utc)
-            error_age_seconds = max(0.0, (datetime.now(timezone.utc) - error_date).total_seconds())
-
-            # Une erreur Telegram n'est active que si elle est récente ET si
-            # aucune requête webhook valide n'a atteint l'application depuis.
-            # Telegram conserve souvent le dernier 404 survenu pendant un
-            # redéploiement Railway, même après plusieurs livraisons en 200.
-            recovered_after_error = (
-                runtime_state.LAST_WEBHOOK_RECEIVED_AT is not None
-                and runtime_state.LAST_WEBHOOK_RECEIVED_AT >= error_date
-            )
-            recent_error = error_age_seconds < 300 and not recovered_after_error
-
-        # Une seule mise à jour peut être le callback Santé lui-même.
-        # On ne déclenche une alerte que si la file commence réellement à
-        # s'accumuler.
-        pending_count = int(webhook.pending_update_count or 0)
-        pending_critical = pending_count > 5
-
-        if url_ok and not recent_error and not pending_critical:
-            checks.append("✅ Webhook Telegram actif")
+        if webhook.url == settings.webhook_url and not webhook.last_error_message:
+            checks.append("✅ Webhook actif et sans erreur connue")
         else:
             checks.append("⚠️ Webhook incorrect ou en erreur")
-            if not url_ok:
+            if webhook.url != settings.webhook_url:
                 alerts.append("URL du webhook différente de PUBLIC_BASE_URL")
-            if recent_error:
-                alerts.append(f"Erreur webhook récente : {webhook.last_error_message}")
-            if pending_critical:
-                alerts.append(f"{pending_count} mises à jour Telegram s'accumulent")
-
-        if pending_count == 0:
-            checks.append("✅ Aucune mise à jour Telegram en attente")
-        elif pending_count <= 5:
-            checks.append(f"ℹ️ {pending_count} mise(s) à jour Telegram en cours de traitement")
-        else:
-            checks.append(f"⚠️ {pending_count} mise(s) à jour Telegram en attente")
-
-        if webhook.last_error_message and not recent_error and error_age_seconds is not None:
-            logger.info(
-                "Erreur webhook historique ignorée dans Santé (âge=%ss, dernier webhook reçu=%s): %s",
-                int(error_age_seconds),
-                runtime_state.LAST_WEBHOOK_RECEIVED_AT,
-                webhook.last_error_message,
-            )
+            if webhook.last_error_message:
+                alerts.append(f"Dernière erreur webhook : {webhook.last_error_message}")
+        if webhook.pending_update_count:
+            checks.append(f"⚠️ {webhook.pending_update_count} mise(s) à jour Telegram en attente")
     except Exception as exc:
         checks.append("❌ Impossible de lire l’état du webhook")
         alerts.append(f"Webhook : {type(exc).__name__}")
@@ -362,34 +158,6 @@ async def build_health_report() -> tuple[str, list[str], str]:
         checks.append("⚠️ Une erreur récente de maintenance est enregistrée")
         alerts.append(f"Maintenance : {LAST_MAINTENANCE_ERROR[:180]}")
 
-    try:
-        async with SessionLocal() as s:
-            impacted = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.removed_at.is_not(None), MembershipRecovery.rejoined_at.is_(None))) or 0)
-            pending_contact = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.removed_at.is_not(None), MembershipRecovery.contacted_at.is_(None))) or 0)
-            contacted = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.removed_at.is_not(None), MembershipRecovery.contacted_at.is_not(None))) or 0)
-            contact_failures = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.removed_at.is_not(None), MembershipRecovery.last_contact_error.is_not(None))) or 0)
-            future_reminders = int(await s.scalar(select(func.count(Membership.id)).where(Membership.active.is_(True), Membership.first_media_at.is_(None))) or 0)
-            first_reminders_sent = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.reminder_24h_sent_at.is_not(None), MembershipRecovery.removed_at.is_(None))) or 0)
-            final_reminders_sent = int(await s.scalar(select(func.count(MembershipRecovery.id)).where(MembershipRecovery.reminder_1h_sent_at.is_not(None), MembershipRecovery.removed_at.is_(None))) or 0)
-            pending_reentry_payments = int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.method == AccessMethod.payment.value, AccessRequest.reference.like("REJOIN%"), AccessRequest.status.in_([AccessStatus.in_progress.value, AccessStatus.pending_review.value]))) or 0)
-            pending_lifetime_payments = int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.method == AccessMethod.payment.value, AccessRequest.reference.like("LIFETIME-%"), AccessRequest.status.in_([AccessStatus.in_progress.value, AccessStatus.pending_review.value]))) or 0)
-            lifetime_members = int(await s.scalar(select(func.count(LifetimeMediaAccess.id)).where(LifetimeMediaAccess.active.is_(True))) or 0)
-        checks.append(f"👥 Expulsés pouvant choisir {settings.reentry_price_eur} € ou {settings.lifetime_reentry_price_eur} € : {impacted}")
-        checks.append(f"✅ Personnes impactées contactées : {contacted}")
-        checks.append(f"📨 Personnes restant à contacter : {pending_contact}")
-        checks.append(f"❌ Échecs de contact : {contact_failures}")
-        checks.append(f"💳 Retours à {settings.reentry_price_eur} € en cours : {pending_reentry_payments}")
-        checks.append(f"♾ Accès permanents à {settings.lifetime_reentry_price_eur} € en cours : {pending_lifetime_payments}")
-        checks.append(f"🛡 Membres permanents actifs : {lifetime_members}")
-        checks.append(f"⏰ Membres suivis avant expulsion : {future_reminders}")
-        checks.append(f"🔔 Premiers rappels envoyés : {first_reminders_sent}")
-        checks.append(f"⚠️ Derniers rappels envoyés : {final_reminders_sent}")
-        if pending_contact:
-            alerts.append(f"{pending_contact} personne(s) impactée(s) restent à contacter")
-    except Exception as exc:
-        checks.append("⚠️ Impossible de compter les personnes impactées")
-        alerts.append(f"Comptage réintégration : {type(exc).__name__}")
-
     status = "OK" if not alerts else ("CRITIQUE" if any(a.startswith("Aucun groupe VIP") or "Base de données" in a or "Telegram" in a for a in alerts) else "ATTENTION")
     text_report = f"<b>🩺 Santé du système — {status}</b>\n\n" + "\n".join(checks)
     if alerts:
@@ -407,18 +175,145 @@ async def automatic_health_alerts() -> None:
         await notify_admins("send_message", "<b>✅ Santé rétablie</b>\n\nTous les contrôles essentiels sont revenus à la normale.")
     LAST_HEALTH_SIGNATURE = signature
 
+async def is_lifetime_user(session, user_id: int) -> bool:
+    return (await get_setting(session, f"lifetime_user:{user_id}", "0")) == "1"
+
+
+async def reentry_buttons(session, user_id: int):
+    if await is_lifetime_user(session, user_id):
+        return [("♾ Réactiver mon accès Lifetime", "reentry:lifetime_free"), ("📜 Consulter les règles", "rules:show")]
+    return [
+        (f"🔄 Demander mon retour — {settings.reentry_price_eur} €", "reentry:start"),
+        (f"♾ Retour Lifetime — {settings.lifetime_price_eur} €", "reentry:lifetime"),
+        ("📜 Consulter les règles", "rules:show"),
+    ]
+
+
+async def startup_membership_audit() -> dict[str, int]:
+    """Répare les incohérences historiques et contacte une seule fois les membres concernés."""
+    stats = {"scanned": 0, "corrected": 0, "eligible": 0, "contacted": 0, "failed": 0, "already_notified": 0}
+    async with SessionLocal() as session:
+        vip = await vip_chat(session)
+        if not vip:
+            for admin_id in settings.admin_id_set:
+                with suppress(Exception):
+                    await bot.send_message(admin_id, "⚠️ Audit de démarrage impossible : aucun groupe VIP n’est configuré.")
+            return stats
+        rows = list((await session.execute(
+            select(Membership, User).join(User, Membership.user_id == User.id).where(Membership.chat_id == vip.id)
+        )).all())
+        for membership, user in rows:
+            stats["scanned"] += 1
+            if membership.active:
+                try:
+                    actual = await bot.get_chat_member(vip.telegram_chat_id, user.telegram_id)
+                    telegram_active = actual.status in {
+                        ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED,
+                        ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR,
+                    }
+                    if not telegram_active:
+                        membership.active = False
+                        stats["corrected"] += 1
+                except Exception:
+                    continue
+            if not membership.active and user.started_bot:
+                stats["eligible"] += 1
+                notification_key = f"reentry_audit_notified:{user.id}"
+                if (await get_setting(session, notification_key, "0")) == "1":
+                    stats["already_notified"] += 1
+                    continue
+                lifetime = await is_lifetime_user(session, user.id)
+                if lifetime:
+                    text = (
+                        "♾ <b>Votre accès Lifetime peut être réactivé</b>\n\n"
+                        "Une ancienne incohérence de statut a été détectée et corrigée. "
+                        "Vous pouvez générer un nouvel accès sans effectuer de nouveau paiement."
+                    )
+                else:
+                    text = (
+                        "🔄 <b>Votre retour est disponible</b>\n\n"
+                        "Votre ancien statut a été vérifié après une mise à jour du bot. "
+                        f"Vous pouvez revenir pour <b>{settings.reentry_price_eur} €</b> ou choisir "
+                        f"l’option <b>Lifetime à {settings.lifetime_price_eur} €</b>."
+                    )
+                try:
+                    await bot.send_message(user.telegram_id, text, reply_markup=kb(await reentry_buttons(session, user.id)))
+                    await set_setting(session, notification_key, "1")
+                    stats["contacted"] += 1
+                except Exception:
+                    stats["failed"] += 1
+        await session.commit()
+
+    report = (
+        "<b>🧰 Bilan de réparation au démarrage</b>\n\n"
+        f"Membres vérifiés : <b>{stats['scanned']}</b>\n"
+        f"Statuts corrigés : <b>{stats['corrected']}</b>\n"
+        f"Personnes éligibles au retour : <b>{stats['eligible']}</b>\n"
+        f"Personnes contactées : <b>{stats['contacted']}</b>\n"
+        f"Déjà contactées auparavant : <b>{stats['already_notified']}</b>\n"
+        f"Contacts impossibles : <b>{stats['failed']}</b>"
+    )
+    for admin_id in settings.admin_id_set:
+        with suppress(Exception):
+            await bot.send_message(admin_id, report)
+    return stats
+
+
+async def reconcile_vip_membership(session, user: User) -> Membership | None:
+    """Réconcilie l’état local avec le statut réel Telegram.
+
+    Compatibilité avec les anciennes versions : certains membres expulsés sont
+    restés marqués active=true dans PostgreSQL. Telegram est la source de vérité.
+    """
+    vip = await vip_chat(session)
+    if not vip:
+        return None
+    membership = await session.scalar(
+        select(Membership).where(
+            Membership.user_id == user.id,
+            Membership.chat_id == vip.id,
+        )
+    )
+    if not membership:
+        return None
+    try:
+        actual = await bot.get_chat_member(vip.telegram_chat_id, user.telegram_id)
+        telegram_active = actual.status in {
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.RESTRICTED,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR,
+        }
+    except Exception:
+        # Ne pas modifier la base si Telegram est temporairement inaccessible.
+        return membership
+    if membership.active and not telegram_active:
+        membership.active = False
+        await session.commit()
+    return membership
+
+
 @r.message(CommandStart())
 async def start(message: Message):
     if message.chat.type != "private": return
     async with SessionLocal() as s:
         user = await get_or_create_user(s, message.from_user)
-        logger.info("Nouvelle connexion user=%s username=%s", message.from_user.id, message.from_user.username)
-        paid_req, link_used = await paid_access_state(s, user.id)
-        recovery = await recovery_for_user(s, user.id)
-    if paid_req:
-        await show_existing_paid_access(message, paid_req, link_used, recovery)
-        return
-    rows = [("📜 Consulter les règles", "rules:show")]
+        await reconcile_vip_membership(s, user)
+        previous_membership = await s.scalar(
+            select(Membership)
+            .join(TelegramChat, Membership.chat_id == TelegramChat.id)
+            .where(
+                Membership.user_id == user.id,
+                TelegramChat.role == "vip",
+                Membership.active.is_(False),
+            )
+            .order_by(Membership.id.desc())
+        )
+    if previous_membership:
+        async with SessionLocal() as s:
+            rows = await reentry_buttons(s, user.id)
+    else:
+        rows = [("📜 Consulter les règles", "rules:show")]
     if await is_admin(message.from_user.id):
         rows.append(("⚙️ Panneau administrateur", "admin:home"))
     async with SessionLocal() as s:
@@ -433,70 +328,113 @@ async def start(message: Message):
     else:
         await message.answer(welcome_text, reply_markup=markup)
 
+@r.callback_query(F.data == "reentry:start")
+async def reentry_start(c: CallbackQuery):
+    async with SessionLocal() as s:
+        user = await get_or_create_user(s, c.from_user)
+        previous_membership = await s.scalar(
+            select(Membership)
+            .join(TelegramChat, Membership.chat_id == TelegramChat.id)
+            .where(Membership.user_id == user.id, TelegramChat.role == "vip", Membership.active.is_(False))
+            .order_by(Membership.id.desc())
+        )
+        if not previous_membership:
+            await c.answer("Aucune exclusion donnant droit à un retour n’a été trouvée.", show_alert=True)
+            return
+        req = await create_request(s, user.id, AccessMethod.payment.value)
+        req.reference = f"RET-{req.reference.removeprefix('VIP-')}"
+        await s.commit()
+    await c.message.edit_text(
+        f"<b>Demande de retour</b>\n\nVotre précédent accès a été retiré pour inactivité. "
+        f"Vous pouvez revenir avec une nouvelle participation de <b>{settings.reentry_price_eur} €</b>.\n"
+        f"Référence : <code>{req.reference}</code>\n\nChoisissez votre moyen de paiement.",
+        reply_markup=payment_keyboard(),
+    )
+    await c.answer()
+
+@r.callback_query(F.data == "reentry:lifetime")
+async def reentry_lifetime(c: CallbackQuery):
+    async with SessionLocal() as s:
+        user = await get_or_create_user(s, c.from_user)
+        previous_membership = await s.scalar(
+            select(Membership).join(TelegramChat, Membership.chat_id == TelegramChat.id)
+            .where(Membership.user_id == user.id, TelegramChat.role == "vip", Membership.active.is_(False))
+            .order_by(Membership.id.desc())
+        )
+        if not previous_membership:
+            await c.answer("Aucune exclusion donnant droit à un retour n’a été trouvée.", show_alert=True)
+            return
+        req = await create_request(s, user.id, AccessMethod.payment.value)
+        req.reference = f"LIFE-{req.reference.removeprefix('VIP-')}"
+        await s.commit()
+    await c.message.edit_text(
+        f"<b>Retour Lifetime</b>\n\nMontant : <b>{settings.lifetime_price_eur} €</b>\n"
+        "Après validation, vos futurs retours ne nécessiteront plus de nouveau paiement. "
+        "Les règles de participation du groupe restent applicables.\n"
+        f"Référence : <code>{req.reference}</code>\n\nChoisissez votre moyen de paiement.",
+        reply_markup=payment_keyboard(),
+    )
+    await c.answer()
+
+
+@r.callback_query(F.data == "reentry:lifetime_free")
+async def reentry_lifetime_free(c: CallbackQuery):
+    async with SessionLocal() as s:
+        user = await get_or_create_user(s, c.from_user)
+        if not await is_lifetime_user(s, user.id):
+            await c.answer("Aucun droit Lifetime actif n’a été trouvé.", show_alert=True)
+            return
+        previous_membership = await s.scalar(
+            select(Membership).join(TelegramChat, Membership.chat_id == TelegramChat.id)
+            .where(Membership.user_id == user.id, TelegramChat.role == "vip", Membership.active.is_(False))
+            .order_by(Membership.id.desc())
+        )
+        if not previous_membership:
+            await c.answer("Votre accès ne nécessite pas de réactivation.", show_alert=True)
+            return
+        req = await create_request(s, user.id, AccessMethod.payment.value)
+        req.reference = f"LIFEFREE-{req.reference.removeprefix('VIP-')}"
+        req.status = AccessStatus.approved.value
+        await s.commit()
+    await c.message.edit_text(
+        "♾ <b>Réactivation Lifetime autorisée</b>\n\nVous pouvez générer un nouveau lien personnel valable 24 heures.",
+        reply_markup=kb([("🔗 Générer mon lien 24 h", f"invite:create:{req.id}")]),
+    )
+    await c.answer()
+
+
 @r.callback_query(F.data == "rules:show")
 async def show_rules(c: CallbackQuery):
-    await edit_message(c.message, RULES, reply_markup=rules_keyboard()); await safe_callback_answer(c)
+    await c.message.edit_text(RULES, reply_markup=rules_keyboard()); await c.answer()
 
 @r.callback_query(F.data == "rules:accept")
 async def accept_rules(c: CallbackQuery):
     async with SessionLocal() as s:
-        user = await get_or_create_user(s, c.from_user)
-        paid_req, link_used = await paid_access_state(s, user.id)
-        recovery = await recovery_for_user(s, user.id)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
-    if paid_req:
-        await show_existing_paid_access(c.message, paid_req, link_used, recovery)
-        await safe_callback_answer(c, "Votre paiement est déjà validé.", show_alert=True)
-        return
     text = "Choisissez votre méthode d’accès :" if enabled else "L’accès est actuellement disponible uniquement par paiement."
-    await edit_message(c.message, text, reply_markup=access_methods(enabled)); await safe_callback_answer(c)
+    await c.message.edit_text(text, reply_markup=access_methods(enabled)); await c.answer()
 
 @r.callback_query(F.data.startswith("access:"))
 async def choose_access(c: CallbackQuery):
     method = c.data.split(":",1)[1]
     async with SessionLocal() as s:
         user = await get_or_create_user(s, c.from_user)
-        paid_req, link_used = await paid_access_state(s, user.id)
-        recovery = await recovery_for_user(s, user.id)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
-        if paid_req:
-            await show_existing_paid_access(c.message, paid_req, link_used, recovery)
-            await safe_callback_answer(c, "Vous avez déjà payé : nouvelle souscription bloquée.", show_alert=True)
-            return
         if method != "payment" and not enabled:
-            await safe_callback_answer(c, "Cette option est désactivée.", show_alert=True); return
+            await c.answer("Cette option est désactivée.", show_alert=True); return
         req = await create_request(s, user.id, method)
     if method == "payment":
-        await edit_message(c.message, f"Le prix de l’accès est de <b>{settings.entry_price_eur} €</b>.\nRéférence : <code>{req.reference}</code>\n\nChoisissez le moyen de paiement.", reply_markup=payment_keyboard())
+        await c.message.edit_text(f"Le prix de l’accès est de <b>{settings.entry_price_eur} €</b>.\nRéférence : <code>{req.reference}</code>\n\nChoisissez le moyen de paiement.", reply_markup=payment_keyboard())
     elif method == "media":
-        await edit_message(c.message, "Envoyez entre 5 et 10 photos ou vidéos représentant la même personne, visage visible. Vous pouvez envoyer un album complet. Après validation, le dossier sera publié dans le groupe et comptera comme première participation.\n\nProgression : <b>0/5</b>", reply_markup=kb([("❌ Annuler", "menu")]))
+        await c.message.edit_text("Envoyez entre 5 et 10 photos ou vidéos représentant la même personne, visage visible. Vous pouvez envoyer un album complet. Après validation, le dossier sera publié dans le groupe et comptera comme première participation.\n\nProgression : <b>0/5</b>", reply_markup=kb([("❌ Annuler", "menu")]))
     else:
         async with SessionLocal() as s:
             pub = await pub_chat(s)
         if not pub:
-            await edit_message(c.message, "Le groupe PUB n’est pas encore configuré. Contactez un administrateur.", reply_markup=kb([("⬅️ Retour", "menu")])) ; return
+            await c.message.edit_text("Le groupe PUB n’est pas encore configuré. Contactez un administrateur."); return
         link = await bot.create_chat_invite_link(pub.telegram_chat_id, name=f"REF-{req.id}", expire_date=req.expires_at, member_limit=99999)
-        await edit_message(c.message, f"Votre lien personnel de parrainage :\n{link.invite_link}\n\nObjectif : <b>{settings.referral_target}</b> invitations validées en 48 heures.\nProgression : <b>0/{settings.referral_target}</b>", reply_markup=kb([("📊 Voir ma progression", f"ref:progress:{req.id}"), ("⬅️ Retour", "menu")]))
-    await safe_callback_answer(c)
-
-@r.callback_query(F.data == "paymethods")
-async def payment_methods_back(c: CallbackQuery):
-    async with SessionLocal() as s:
-        user = await get_or_create_user(s, c.from_user)
-        req = await active_request(s, user.id)
-    if not req or req.method != AccessMethod.payment.value:
-        await safe_callback_answer(c, "Aucune demande de paiement active.", show_alert=True)
-        return
-    amount = payment_amount_for_reference(req.reference)
-    await edit_message(
-        c.message,
-        f"Le prix de l’accès est de <b>{amount} €</b>.\n"
-        f"Référence : <code>{escape(req.reference)}</code>\n\n"
-        "Choisissez le moyen de paiement.",
-        reply_markup=payment_keyboard(),
-    )
-    await safe_callback_answer(c)
-
+        await c.message.edit_text(f"Votre lien personnel de parrainage :\n{link.invite_link}\n\nObjectif : <b>{settings.referral_target}</b> invitations validées en 48 heures.\nProgression : <b>0/{settings.referral_target}</b>", reply_markup=kb([("📊 Voir ma progression", f"ref:progress:{req.id}")]))
+    await c.answer()
 
 @r.callback_query(F.data.startswith("payment:"))
 async def payment_choice(c: CallbackQuery):
@@ -506,9 +444,10 @@ async def payment_choice(c: CallbackQuery):
     async with SessionLocal() as s:
         user = await get_or_create_user(s, c.from_user); req = await active_request(s, user.id)
     if not req:
-        await safe_callback_answer(c, "Aucune demande de paiement active.", show_alert=True)
-        return
-    amount = payment_amount_for_reference(req.reference)
+        await c.answer("Aucune demande de paiement active.", show_alert=True); return
+    price = (settings.lifetime_price_eur if (req.reference or "").startswith("LIFE-")
+             else settings.reentry_price_eur if (req.reference or "").startswith("RET-")
+             else settings.entry_price_eur)
     extra = ""
     if method == "paypal":
         extra = (
@@ -516,29 +455,8 @@ async def payment_choice(c: CallbackQuery):
             "Ne classez pas volontairement un achat d’accès comme un envoi personnel afin de contourner les frais ou protections. "
             "Un paiement non conforme pourra être refusé et transmis aux administrateurs pour examen."
         )
-    safe_details = escape(details or "Non configuré")
-    raw_details = (details or "").strip()
-    if raw_details.lower().startswith(("https://", "http://")):
-        destination = f'<a href="{safe_details}">{safe_details}</a>'
-    elif "@" in raw_details and "." in raw_details.split("@")[-1]:
-        destination = f'<a href="mailto:{safe_details}">{safe_details}</a>'
-    elif raw_details.startswith("@"):
-        username = escape(raw_details[1:])
-        destination = f'<a href="https://t.me/{username}">{safe_details}</a>'
-    else:
-        destination = f"<code>{safe_details}</code>"
-
-    await edit_message(
-        c.message,
-        f"Envoyez exactement <b>{amount} €</b>.\n"
-        f"Moyen : <b>{method.title()}</b>\n"
-        f"Destinataire : {destination}\n"
-        f"Référence obligatoire : <code>{escape(req.reference)}</code>{extra}\n\n"
-        "Envoyez ensuite la capture d’écran ici.",
-        reply_markup=payment_details_keyboard(),
-        disable_web_page_preview=True,
-    )
-    await safe_callback_answer(c)
+    await c.message.edit_text(f"Envoyez exactement <b>{price} €</b>.\nMoyen : <b>{method.title()}</b>\nDestinataire : <code>{details}</code>\nRéférence obligatoire : <code>{req.reference}</code>{extra}\n\nEnvoyez ensuite la capture d’écran ici.")
+    await c.answer()
 
 @r.message(F.chat.type == "private", F.photo)
 async def private_photo(message: Message):
@@ -553,13 +471,15 @@ async def private_photo(message: Message):
         user = await get_or_create_user(s, message.from_user); req = await active_request(s, user.id)
         if not req: return
         if req.method == AccessMethod.payment.value:
-            logger.info("Paiement reçu user=%s request=%s", message.from_user.id, req.id)
             proof = PaymentProof(request_id=req.id, file_id=message.photo[-1].file_id, payment_method="manual")
             req.status = AccessStatus.pending_review.value; s.add(proof); await s.commit()
-            cap = f"Paiement à vérifier\nUtilisateur : {message.from_user.full_name} (@{message.from_user.username or '-'})\nID : <code>{message.from_user.id}</code>\nRéférence : <code>{req.reference}</code>"
+            expected_price = (settings.lifetime_price_eur if (req.reference or "").startswith("LIFE-")
+             else settings.reentry_price_eur if (req.reference or "").startswith("RET-")
+             else settings.entry_price_eur)
+            cap = f"Paiement à vérifier\nUtilisateur : {message.from_user.full_name} (@{message.from_user.username or '-'})\nID : <code>{message.from_user.id}</code>\nRéférence : <code>{req.reference}</code>\nMontant attendu : <b>{expected_price} €</b>"
             markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Valider", callback_data=f"review:pay:ok:{req.id}"),InlineKeyboardButton(text="❌ Refuser", callback_data=f"review:pay:no:{req.id}")]])
             await notify_admins("send_photo", proof.file_id, caption=cap, reply_markup=markup)
-            await message.answer("Votre justificatif a été reçu et envoyé aux administrateurs.", reply_markup=kb([("🏠 Menu principal", "menu")]))
+            await message.answer("Votre justificatif a été reçu et envoyé aux administrateurs.")
         elif req.method == AccessMethod.media.value:
             count = int(await s.scalar(select(func.count(MediaSubmission.id)).where(MediaSubmission.request_id == req.id)) or 0)
             if count >= 10: await message.answer("Maximum de 10 médias atteint."); return
@@ -585,9 +505,9 @@ async def submit_media(c: CallbackQuery):
     async with SessionLocal() as s:
         req = await s.get(AccessRequest, req_id)
         files = list((await s.scalars(select(MediaSubmission).where(MediaSubmission.request_id == req_id))).all())
-        if not req or req.user_id != (await get_or_create_user(s,c.from_user)).id or len(files)<5: await safe_callback_answer(c, "Dossier incomplet",show_alert=True); return
+        if not req or req.user_id != (await get_or_create_user(s,c.from_user)).id or len(files)<5: await c.answer("Dossier incomplet",show_alert=True); return
         req.status=AccessStatus.pending_review.value; await s.commit()
-    for aid in settings.admin_id_set:
+    for aid in await detected_admin_ids():
         try:
             await bot.send_message(aid, f"Dossier média #{req_id} — {len(files)} médias", reply_markup=kb([("✅ Accepter", f"review:media:ok:{req_id}"),("❌ Refuser", f"review:media:no:{req_id}")]))
             for f in files:
@@ -595,98 +515,34 @@ async def submit_media(c: CallbackQuery):
                 else: await bot.send_video(aid,f.file_id)
         except Exception:
             pass
-    await edit_message(c.message, "Votre dossier a été transmis aux modérateurs.", reply_markup=kb([("🏠 Menu principal", "menu")])) ; await safe_callback_answer(c)
+    await c.message.edit_text("Votre dossier a été transmis aux modérateurs."); await c.answer()
 
 @r.callback_query(F.data.startswith("review:"))
 async def review(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): await safe_callback_answer(c, "Accès refusé",show_alert=True); return
+    if not await is_admin(c.from_user.id): await c.answer("Accès refusé",show_alert=True); return
     _,kind,decision,reqid = c.data.split(":"); req_id=int(reqid)
     async with SessionLocal() as s:
         req=await s.get(AccessRequest,req_id)
         if not req: return
         req.status=AccessStatus.approved.value if decision=="ok" else AccessStatus.rejected.value
-        user=await s.get(User,req.user_id); await s.commit()
+        user=await s.get(User,req.user_id)
+        if decision == "ok" and (req.reference or "").startswith("LIFE-"):
+            await set_setting(s, f"lifetime_user:{user.id}", "1")
+        await s.commit()
         if decision=="ok":
-            if (req.reference or "").startswith("LIFETIME-"):
-                entitlement = await s.scalar(select(LifetimeMediaAccess).where(LifetimeMediaAccess.user_id == user.id))
-                if entitlement:
-                    entitlement.active = True
-                    entitlement.payment_request_id = req.id
-                else:
-                    s.add(LifetimeMediaAccess(user_id=user.id, payment_request_id=req.id, active=True))
-                await s.commit()
-                text_value = (
-                    f"✅ Votre accès permanent de {settings.lifetime_reentry_price_eur} € a été validé. "
-                    "Vous pourrez rester dans le groupe sans obligation d’envoyer des médias."
-                )
-            elif (req.reference or "").startswith(("REJOIN-", "REJOIN5-")):
-                text_value = f"✅ Votre paiement de réintégration de {settings.reentry_price_eur} € a été validé. Vous pouvez générer votre nouveau lien d’accès."
-            else:
-                text_value = "✅ Votre demande a été validée."
-            await bot.send_message(user.telegram_id, text_value, reply_markup=kb([("🔗 Générer mon lien 24 h",f"invite:create:{req.id}")]))
+            await bot.send_message(user.telegram_id,"Votre demande a été validée.",reply_markup=kb([("🔗 Générer mon lien 24 h",f"invite:create:{req.id}")]))
         else: await bot.send_message(user.telegram_id,"Votre demande a été refusée. Le paiement reste disponible depuis /start.")
-    await c.message.edit_reply_markup(reply_markup=None); await safe_callback_answer(c, "Décision enregistrée")
-
-@r.callback_query(F.data.startswith("recovery:payment:"))
-async def recovery_payment(c: CallbackQuery):
-    recovery_id = int(c.data.rsplit(":", 1)[1])
-    async with SessionLocal() as s:
-        user = await get_or_create_user(s, c.from_user)
-        recovery = await s.get(MembershipRecovery, recovery_id)
-        membership = await s.get(Membership, recovery.membership_id) if recovery else None
-        if not recovery or not membership or membership.user_id != user.id or recovery.removed_at is None:
-            await safe_callback_answer(c, "Paiement de réintégration indisponible.", show_alert=True)
-            return
-        req = await active_request(s, user.id)
-        if not req or req.method != AccessMethod.payment.value or not (req.reference or "").startswith("REJOIN-"):
-            req = await create_request(s, user.id, AccessMethod.payment.value, reference_prefix="REJOIN")
-    await edit_or_send(
-        c.message,
-        f"Le prix de la réintégration est de <b>{settings.reentry_price_eur} €</b>.\n"
-        f"Référence : <code>{escape(req.reference)}</code>\n\n"
-        "Choisissez le moyen de paiement.",
-        reply_markup=payment_keyboard(),
-    )
-    await safe_callback_answer(c)
-
-
-@r.callback_query(F.data.startswith("recovery:lifetime:"))
-async def recovery_lifetime_payment(c: CallbackQuery):
-    recovery_id = int(c.data.rsplit(":", 1)[1])
-    async with SessionLocal() as s:
-        user = await get_or_create_user(s, c.from_user)
-        recovery = await s.get(MembershipRecovery, recovery_id)
-        membership = await s.get(Membership, recovery.membership_id) if recovery else None
-        if not recovery or not membership or membership.user_id != user.id or recovery.removed_at is None:
-            await safe_callback_answer(c, "Paiement permanent indisponible.", show_alert=True)
-            return
-        entitlement = await s.scalar(select(LifetimeMediaAccess).where(LifetimeMediaAccess.user_id == user.id, LifetimeMediaAccess.active.is_(True)))
-        if entitlement:
-            await safe_callback_answer(c, "Votre accès permanent est déjà actif.", show_alert=True)
-            return
-        req = await active_request(s, user.id)
-        if not req or req.method != AccessMethod.payment.value or not (req.reference or "").startswith("LIFETIME-"):
-            req = await create_request(s, user.id, AccessMethod.payment.value, reference_prefix="LIFETIME")
-    await edit_or_send(
-        c.message,
-        f"L’accès permanent coûte <b>{settings.lifetime_reentry_price_eur} €</b>.\n"
-        "Après validation, vous pourrez rester dans le groupe sans obligation d’envoyer des médias.\n"
-        f"Référence : <code>{escape(req.reference)}</code>\n\n"
-        "Choisissez le moyen de paiement.",
-        reply_markup=payment_keyboard(),
-    )
-    await safe_callback_answer(c)
-
+    await c.message.edit_reply_markup(reply_markup=None); await c.answer("Décision enregistrée")
 
 @r.callback_query(F.data.startswith("invite:create:"))
 async def invite_create(c: CallbackQuery):
     req_id=int(c.data.rsplit(":",1)[1])
     async with SessionLocal() as s:
         user=await get_or_create_user(s,c.from_user); req=await s.get(AccessRequest,req_id)
-        if not req or req.user_id!=user.id or req.status!=AccessStatus.approved.value: await safe_callback_answer(c, "Accès non autorisé",show_alert=True); return
+        if not req or req.user_id!=user.id or req.status!=AccessStatus.approved.value: await c.answer("Accès non autorisé",show_alert=True); return
         old=await s.scalar(select(Invite).where(Invite.user_id==user.id,Invite.revoked.is_(False),Invite.used_at.is_(None),Invite.expires_at>datetime.now(timezone.utc)))
         inv=old or await create_personal_invite(bot,s,user,req)
-    await edit_message(c.message, f"Votre lien personnel est valable 24 heures :\n{inv.invite_link}\n\nNe le partagez pas.", reply_markup=kb([("🏠 Menu principal", "menu")])) ; await safe_callback_answer(c)
+    await c.message.edit_text(f"Votre lien personnel est valable 24 heures :\n{inv.invite_link}\n\nNe le partagez pas."); await c.answer()
 
 @r.chat_join_request()
 async def join_request(j: ChatJoinRequest):
@@ -703,25 +559,11 @@ async def join_request(j: ChatJoinRequest):
             s.add(membership)
             await s.flush()
         else:
-            membership.active=True
-            membership.joined_at=datetime.now(timezone.utc)
-            membership.first_media_at=None
-            membership.warned_first_day=False
-            membership.warned_activity=False
-            recovery = await s.scalar(select(MembershipRecovery).where(MembershipRecovery.membership_id == membership.id))
-            if recovery:
-                recovery.rejoin_count += 1
-                recovery.rejoined_at = datetime.now(timezone.utc)
-                recovery.reminder_24h_sent_at = None
-                recovery.reminder_1h_sent_at = None
-                recovery.removed_at = None
-                recovery.contacted_at = None
-                recovery.last_contact_error = None
-                # Le cycle repart immédiatement; rejoined_at est seulement informatif.
-        lifetime_access = await has_lifetime_media_access(s, user.id)
-        if lifetime_access:
-            # Une date non nulle exclut ce membre des contrôles de premier média.
-            membership.first_media_at = datetime.now(timezone.utc)
+            membership.active = True
+            membership.joined_at = datetime.now(timezone.utc)
+            membership.first_media_at = None
+            membership.warned_first_day = False
+            membership.warned_activity = False
         # Un dossier accepté est publié à l'entrée et compte comme première participation.
         if req.method == AccessMethod.media.value:
             files=list((await s.scalars(select(MediaSubmission).where(MediaSubmission.request_id==req.id))).all())
@@ -732,70 +574,11 @@ async def join_request(j: ChatJoinRequest):
                 except Exception:
                     pass
             membership.first_media_at=datetime.now(timezone.utc)
+            membership.warned_first_day = True
+            membership.warned_activity = False
         await s.commit()
     await bot.send_message(user.telegram_id,"Bienvenue dans le groupe VIP. Consultez /statut pour suivre votre activité.")
 
-
-@r.callback_query(F.data == "paid:already_used")
-async def paid_already_used(c: CallbackQuery):
-    await safe_callback_answer(c, "Votre accès a déjà été utilisé.", show_alert=True)
-
-async def system_message_deletion_enabled() -> bool:
-    """Retourne le réglage sans laisser une panne PostgreSQL bloquer la modération.
-
-    La valeur par défaut reste activée. Ainsi, les notifications d’entrée/sortie
-    sont supprimées même pendant une reconnexion temporaire à la base.
-    """
-    try:
-        async with SessionLocal() as s:
-            return (await get_setting(s, "delete_system_messages", "1")) == "1"
-    except Exception:
-        logger.exception("Erreur base de données pendant la lecture du réglage messages système")
-        return True
-
-
-async def delete_system_message(message: Message, event_name: str) -> None:
-    if message.chat.type not in {"group", "supergroup"}:
-        return
-    if not await system_message_deletion_enabled():
-        return
-    deleted = await safe_delete(message)
-    if deleted:
-        logger.info("Message système supprimé type=%s chat=%s message=%s", event_name, message.chat.id, message.message_id)
-    else:
-        logger.warning(
-            "Message système non supprimé type=%s chat=%s message=%s. "
-            "Vérifiez que le bot est administrateur avec le droit Supprimer les messages.",
-            event_name, message.chat.id, message.message_id,
-        )
-
-
-@r.message(F.new_chat_members)
-async def delete_join_service_message(message: Message):
-    """Supprime les notifications Telegram d’entrée et d’ajout de membres."""
-    await delete_system_message(message, "new_chat_members")
-
-
-@r.message(F.left_chat_member)
-async def delete_leave_service_message(message: Message):
-    """Supprime les notifications Telegram de sortie ou d’exclusion."""
-    await delete_system_message(message, "left_chat_member")
-
-
-@r.message(
-    F.pinned_message
-    | F.new_chat_title
-    | F.new_chat_photo
-    | F.delete_chat_photo
-    | F.group_chat_created
-    | F.supergroup_chat_created
-    | F.channel_chat_created
-    | F.message_auto_delete_timer_changed
-    | F.migrate_to_chat_id
-    | F.migrate_from_chat_id
-)
-async def delete_other_service_messages(message: Message):
-    await delete_system_message(message, "other_service_message")
 
 @r.chat_member()
 async def member_update(event: ChatMemberUpdated):
@@ -844,22 +627,22 @@ async def bot_chat_update(event: ChatMemberUpdated):
 @r.callback_query(F.data.startswith("chatrole:"))
 async def chat_role(c: CallbackQuery):
     _,role,cid=c.data.split(":"); chat_id=int(cid)
-    if not is_owner_admin(c.from_user.id):
-        await safe_callback_answer(c, "Accès réservé au propriétaire du bot.", show_alert=True)
+    if not await is_admin(c.from_user.id, chat_id):
+        await c.answer("Seul un administrateur de ce groupe peut choisir son rôle.", show_alert=True)
         return
     async with SessionLocal() as s:
         if role=="vip":
             old=await s.scalar(select(TelegramChat).where(TelegramChat.role=="vip"));
             if old: old.role="unassigned"
         chat=await s.scalar(select(TelegramChat).where(TelegramChat.telegram_chat_id==chat_id)); chat.role=role; await s.commit()
-    await edit_message(c.message, f"Groupe configuré comme {role.upper()}."); await safe_callback_answer(c)
+    await c.message.edit_text(f"Groupe configuré comme {role.upper()}."); await c.answer()
 
 async def render_admin_panel(target: Message, edit: bool = False):
     async with SessionLocal() as s:
         opt=(await get_setting(s,"alternative_access_enabled","1"))=="1"
         opened=(await get_setting(s,"group_open","1"))=="1"
     if edit:
-        await edit_message(target, "<b>Panneau administrateur</b>\n\nTous les réglages sont accessibles avec les boutons ci-dessous.", reply_markup=admin_home(opt,opened))
+        await target.edit_text("<b>Panneau administrateur</b>\n\nTous les réglages sont accessibles avec les boutons ci-dessous.", reply_markup=admin_home(opt,opened))
     else:
         await target.answer("<b>Panneau administrateur</b>\n\nTous les réglages sont accessibles avec les boutons ci-dessous.", reply_markup=admin_home(opt,opened))
 
@@ -873,10 +656,10 @@ async def admin(message: Message):
 @r.callback_query(F.data=="admin:home")
 async def admin_home_callback(c: CallbackQuery):
     if not await is_admin(c.from_user.id):
-        await safe_callback_answer(c, "Accès refusé", show_alert=True)
+        await c.answer("Accès refusé", show_alert=True)
         return
     await render_admin_panel(c.message, edit=True)
-    await safe_callback_answer(c)
+    await c.answer()
 
 @r.callback_query(F.data=="admin:toggle_options")
 async def toggle_options(c: CallbackQuery):
@@ -884,12 +667,12 @@ async def toggle_options(c: CallbackQuery):
     async with SessionLocal() as s:
         current=(await get_setting(s,"alternative_access_enabled","1"))=="1"; await set_setting(s,"alternative_access_enabled","0" if current else "1")
         opened=(await get_setting(s,"group_open","1"))=="1"
-    await c.message.edit_reply_markup(reply_markup=admin_home(not current,opened)); await safe_callback_answer(c, "Réglage modifié")
+    await c.message.edit_reply_markup(reply_markup=admin_home(not current,opened)); await c.answer("Réglage modifié")
 
 @r.callback_query(F.data=="admin:toggle_group")
 async def toggle_group(c: CallbackQuery):
     if not await is_admin(c.from_user.id):
-        await safe_callback_answer(c, "Accès refusé", show_alert=True)
+        await c.answer("Accès refusé", show_alert=True)
         return
 
     async with SessionLocal() as s:
@@ -898,8 +681,8 @@ async def toggle_group(c: CallbackQuery):
         try:
             await set_group_open(bot, s, not current)
         except RuntimeError as exc:
-            await safe_callback_answer(c, str(exc), show_alert=True)
-            await edit_message(c.message, 
+            await c.answer(str(exc), show_alert=True)
+            await c.message.edit_text(
                 "⚠️ <b>Action impossible</b>\n\n"
                 "Aucun groupe VIP n’est encore configuré.\n\n"
                 "Ajoutez le bot à votre groupe, donnez-lui les droits administrateur, "
@@ -908,8 +691,8 @@ async def toggle_group(c: CallbackQuery):
             )
             return
         except Exception as exc:
-            await safe_callback_answer(c, "Impossible de modifier le groupe. Consultez Santé du système.", show_alert=True)
-            await edit_message(c.message, 
+            await c.answer("Impossible de modifier le groupe. Consultez Santé du système.", show_alert=True)
+            await c.message.edit_text(
                 "❌ <b>Modification impossible</b>\n\n"
                 f"Telegram a refusé la modification : <code>{type(exc).__name__}</code>.\n"
                 "Vérifiez que le bot est administrateur du groupe VIP et possède le droit de modifier les permissions.",
@@ -918,12 +701,12 @@ async def toggle_group(c: CallbackQuery):
             return
 
     await c.message.edit_reply_markup(reply_markup=admin_home(opt, not current))
-    await safe_callback_answer(c, "Groupe ouvert" if not current else "Groupe fermé")
+    await c.answer("Groupe ouvert" if not current else "Groupe fermé")
 
 @r.callback_query(F.data=="admin:groups")
 async def admin_groups(c: CallbackQuery):
     if not await is_admin(c.from_user.id):
-        await safe_callback_answer(c, "Accès refusé", show_alert=True); return
+        await c.answer("Accès refusé", show_alert=True); return
     async with SessionLocal() as s:
         chats=list((await s.scalars(select(TelegramChat).order_by(TelegramChat.id))).all())
     lines=["<b>Groupes détectés</b>"]
@@ -932,33 +715,33 @@ async def admin_groups(c: CallbackQuery):
         lines.append(f"• {chat.title or chat.telegram_chat_id} — <b>{chat.role.upper()}</b> — {'actif' if chat.active else 'inactif'}")
         rows.append((f"⚙️ {chat.title[:28] or chat.telegram_chat_id}", f"admin:group:{chat.telegram_chat_id}"))
     rows.append(("⬅️ Retour", "admin:home"))
-    await edit_message(c.message, "\n".join(lines) if chats else "Aucun groupe détecté.", reply_markup=kb(rows))
-    await safe_callback_answer(c)
+    await c.message.edit_text("\n".join(lines) if chats else "Aucun groupe détecté.", reply_markup=kb(rows))
+    await c.answer()
 
 @r.callback_query(F.data.startswith("admin:group:"))
 async def admin_group_detail(c: CallbackQuery):
     chat_id=int(c.data.rsplit(":",1)[1])
-    if not is_owner_admin(c.from_user.id):
-        await safe_callback_answer(c, "Accès réservé au propriétaire du bot.", show_alert=True); return
+    if not await is_admin(c.from_user.id, chat_id):
+        await c.answer("Vous devez administrer ce groupe.", show_alert=True); return
     async with SessionLocal() as s:
         chat=await s.scalar(select(TelegramChat).where(TelegramChat.telegram_chat_id==chat_id))
     if not chat:
-        await safe_callback_answer(c, "Groupe introuvable", show_alert=True); return
+        await c.answer("Groupe introuvable", show_alert=True); return
     markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Définir VIP",callback_data=f"chatrole:vip:{chat_id}"), InlineKeyboardButton(text="📣 Définir PUB",callback_data=f"chatrole:pub:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Retour",callback_data="admin:groups")],
     ])
-    await edit_message(c.message, f"<b>{chat.title}</b>\nID : <code>{chat.telegram_chat_id}</code>\nRôle actuel : <b>{chat.role.upper()}</b>", reply_markup=markup)
-    await safe_callback_answer(c)
+    await c.message.edit_text(f"<b>{chat.title}</b>\nID : <code>{chat.telegram_chat_id}</code>\nRôle actuel : <b>{chat.role.upper()}</b>", reply_markup=markup)
+    await c.answer()
 
 @r.callback_query(F.data == "admin:health")
 async def admin_health(c: CallbackQuery):
     if not await is_admin(c.from_user.id):
-        await safe_callback_answer(c, "Accès refusé", show_alert=True)
+        await c.answer("Accès refusé", show_alert=True)
         return
-    await safe_callback_answer(c, "Vérification en cours…")
+    await c.answer("Vérification en cours…")
     report, _, _ = await build_health_report()
-    await edit_message(c.message, report, reply_markup=kb([("🔄 Relancer le diagnostic", "admin:health"), ("⬅️ Retour", "admin:home")]))
+    await c.message.edit_text(report, reply_markup=kb([("🔄 Relancer le diagnostic", "admin:health"), ("⬅️ Retour", "admin:home")]))
 
 @r.message(Command("statut"))
 async def status(message: Message):
@@ -970,49 +753,40 @@ async def status(message: Message):
         count=await activity_count(s,m.id)
     await message.answer(f"Médias comptabilisés sur 72 h : <b>{count}/{settings.activity_media_target}</b>")
 
+@r.callback_query(F.data == "member:status")
+async def member_status_button(c: CallbackQuery):
+    async with SessionLocal() as s:
+        user = await get_or_create_user(s, c.from_user)
+        vip = await vip_chat(s)
+        membership = None if not vip else await s.scalar(select(Membership).where(Membership.user_id == user.id, Membership.chat_id == vip.id, Membership.active.is_(True)))
+        if not membership:
+            await c.answer("Vous n’êtes pas membre actif.", show_alert=True); return
+        count = await activity_count(s, membership.id)
+        first = "reçu" if membership.first_media_at else "en attente"
+    await c.message.answer(f"<b>Votre activité</b>\n\nPremier média : <b>{first}</b>\nMédias sur 72 h : <b>{count}/{settings.activity_media_target}</b>")
+    await c.answer()
+
+@r.callback_query(F.data == "reentry:info")
+async def reentry_info(c: CallbackQuery):
+    await c.answer(f"Le retour à {settings.reentry_price_eur} € devient disponible seulement après une exclusion.", show_alert=True)
+
 @r.message(F.chat.type.in_({"group","supergroup"}))
 async def group_messages(message: Message):
-    if not message.from_user or message.from_user.is_bot:
-        return
-    try:
-        async with SessionLocal() as s:
-            chat = await s.scalar(select(TelegramChat).where(TelegramChat.telegram_chat_id == message.chat.id))
-            if not chat or chat.role != "vip":
-                return
-            sender_admin = await is_admin(message.from_user.id, message.chat.id)
-            text_value = message.text or message.caption or ""
-
-            hit = await forbidden_word_hit(s, text_value)
-            if hit and not sender_admin:
-                await safe_delete(message)
-                await stat_inc(s, "forbidden_words_blocked")
-                sanction = await get_setting(s, "forbidden_words_sanction", "warning")
-                await s.commit()
-                await apply_sanction(bot, message, sanction, "mot interdit")
-                logger.info("Mot interdit chat=%s user=%s word=%s", message.chat.id, message.from_user.id, hit)
-                return
-
-            if await links_blocked(s, message, sender_admin):
-                await safe_delete(message)
-                await stat_inc(s, "links_blocked")
-                sanction = await get_setting(s, "anti_links_sanction", "warning")
-                await s.commit()
-                await apply_sanction(bot, message, sanction, "lien interdit")
-                logger.info("Lien bloqué chat=%s user=%s", message.chat.id, message.from_user.id)
-                return
-
-            if (message.photo or message.video) and await process_repost(bot, s, message):
-                return
-
-            user = await get_or_create_user(s, message.from_user)
-            membership = await s.scalar(select(Membership).where(Membership.user_id == user.id, Membership.chat_id == chat.id, Membership.active.is_(True)))
-            if membership and (message.photo or message.video):
-                if not membership.first_media_at:
-                    membership.first_media_at = datetime.now(timezone.utc)
-                s.add(ActivityMedia(membership_id=membership.id, message_id=message.message_id, media_type="photo" if message.photo else "video"))
-                await s.commit()
-    except Exception:
-        logger.exception("Erreur modération message chat=%s", message.chat.id)
+    if not message.from_user or message.from_user.is_bot: return
+    async with SessionLocal() as s:
+        chat=await s.scalar(select(TelegramChat).where(TelegramChat.telegram_chat_id==message.chat.id))
+        if not chat or chat.role!="vip": return
+        user=await get_or_create_user(s,message.from_user)
+        m=await s.scalar(select(Membership).where(Membership.user_id==user.id,Membership.chat_id==chat.id,Membership.active.is_(True)))
+        if not m: return
+        if message.photo or message.video:
+            if not m.first_media_at: m.first_media_at=datetime.now(timezone.utc)
+            s.add(ActivityMedia(membership_id=m.id,message_id=message.message_id,media_type="photo" if message.photo else "video")); await s.commit()
+        entities=(message.entities or [])+(message.caption_entities or [])
+        has_link=any(e.type in {"url","text_link"} for e in entities)
+        if has_link and not await is_admin(message.from_user.id):
+            try: await message.delete(); await bot.ban_chat_member(message.chat.id,message.from_user.id); await bot.send_message(message.from_user.id,"Vous avez été banni pour envoi d’un lien interdit.")
+            except Exception: pass
 
 async def maintenance_loop():
     global LAST_MAINTENANCE_AT, LAST_MAINTENANCE_ERROR
@@ -1041,81 +815,70 @@ async def maintenance_loop():
                     for m in memberships:
                         user=await s.get(User,m.user_id); chat=await s.get(TelegramChat,m.chat_id)
                         age=now-m.joined_at
-                        if await has_lifetime_media_access(s, m.user_id):
-                            if m.first_media_at is None:
-                                m.first_media_at = now
-                            continue
-                        if not m.first_media_at:
-                            recovery = await s.scalar(select(MembershipRecovery).where(MembershipRecovery.membership_id == m.id))
-                            if not recovery:
-                                recovery = MembershipRecovery(membership_id=m.id, reason="missing_first_media")
-                                s.add(recovery)
-                                await s.flush()
-                            deadline = m.joined_at + timedelta(hours=settings.first_media_hours)
-                            remaining = deadline - now
-                            first_reminder_hours = max(1, min(settings.first_media_reminder_hours, settings.first_media_hours))
-                            if remaining <= timedelta(hours=first_reminder_hours) and remaining > timedelta(minutes=settings.first_media_final_reminder_minutes) and recovery.reminder_24h_sent_at is None:
+                        first_deadline = m.joined_at + timedelta(hours=settings.first_media_hours)
+                        first_reminder_at = first_deadline - timedelta(hours=min(6, max(1, settings.first_media_hours // 4)))
+                        if not m.first_media_at and not m.warned_first_day and now >= first_reminder_at and now < first_deadline:
+                            remaining = max(1, int((first_deadline - now).total_seconds() // 3600) + 1)
+                            try:
+                                await bot.send_message(
+                                    user.telegram_id,
+                                    f"⚠️ <b>Rappel de participation</b>\n\nVous n’avez pas encore publié votre premier média valide dans le groupe VIP. "
+                                    f"Il vous reste environ <b>{remaining} heure(s)</b> avant le retrait automatique de votre accès.",
+                                    reply_markup=kb([("📊 Voir mon statut", "member:status"), (f"🔄 Retour possible à {settings.reentry_price_eur} €", "reentry:info")]),
+                                )
+                                m.warned_first_day = True
+                            except Exception as exc:
+                                print("first media reminder error", user.telegram_id, repr(exc))
+                        if not m.first_media_at and now >= first_deadline:
+                            try:
+                                await bot.ban_chat_member(chat.telegram_chat_id,user.telegram_id)
+                                await bot.unban_chat_member(chat.telegram_chat_id,user.telegram_id,only_if_banned=True)
+                                await bot.send_message(
+                                    user.telegram_id,
+                                    "❌ <b>Accès retiré</b>\n\nVotre accès a été retiré parce qu’aucun premier média valide n’a été publié dans le délai prévu. "
+                                    f"Vous pouvez demander à revenir avec une participation de <b>{settings.reentry_price_eur} €</b>.",
+                                    reply_markup=kb([
+                                        (f"🔄 Demander mon retour — {settings.reentry_price_eur} €", "reentry:start"),
+                                        (f"♾ Retour Lifetime — {settings.lifetime_price_eur} €", "reentry:lifetime"),
+                                        ("📜 Consulter les règles", "rules:show"),
+                                    ]),
+                                )
+                            except Exception as exc:
+                                print("first media exclusion notification error", user.telegram_id, repr(exc))
+                            m.active=False
+                        elif m.first_media_at:
+                            activity_deadline = m.joined_at + timedelta(hours=settings.activity_window_hours)
+                            activity_reminder_at = activity_deadline - timedelta(hours=min(12, max(1, settings.activity_window_hours // 4)))
+                            count = await activity_count(s,m.id)
+                            if count < settings.activity_media_target and not m.warned_activity and now >= activity_reminder_at and now < activity_deadline:
+                                remaining = settings.activity_media_target - count
                                 try:
-                                    await bot.send_message(user.telegram_id, f"⏳ <b>Rappel</b> : il vous reste environ {max(1, int(remaining.total_seconds() // 3600))} heure(s) pour publier votre premier média et conserver votre accès au groupe VIP.")
-                                    recovery.reminder_24h_sent_at = now
+                                    await bot.send_message(
+                                        user.telegram_id,
+                                        f"⚠️ <b>Activité insuffisante</b>\n\nVous avez publié <b>{count}/{settings.activity_media_target}</b> médias valides. "
+                                        f"Il vous en reste <b>{remaining}</b> à publier avant l’échéance.",
+                                        reply_markup=kb([("📊 Voir mon statut", "member:status")]),
+                                    )
+                                    m.warned_activity = True
                                 except Exception as exc:
-                                    recovery.last_contact_error = repr(exc)[:1000]
-                            if remaining <= timedelta(minutes=settings.first_media_final_reminder_minutes) and remaining > timedelta(0) and recovery.reminder_1h_sent_at is None:
-                                try:
-                                    await bot.send_message(user.telegram_id, f"⚠️ <b>Dernier rappel</b> : il vous reste moins de {settings.first_media_final_reminder_minutes} minute(s) pour publier votre premier média.")
-                                    recovery.reminder_1h_sent_at = now
-                                except Exception as exc:
-                                    recovery.last_contact_error = repr(exc)[:1000]
-                            if now >= deadline:
+                                    print("activity reminder error", user.telegram_id, repr(exc))
+                            if now >= activity_deadline and count < settings.activity_media_target:
                                 try:
                                     await bot.ban_chat_member(chat.telegram_chat_id,user.telegram_id)
                                     await bot.unban_chat_member(chat.telegram_chat_id,user.telegram_id,only_if_banned=True)
-                                except Exception:
-                                    logger.exception("Erreur exclusion premier média chat=%s user=%s", chat.telegram_chat_id, user.telegram_id)
-                                m.active=False
-                                recovery.removed_at = now
-                                recovery.rejoined_at = None
-                                recovery.contacted_at = None
-                                recovery.contact_attempts += 1
-                                try:
-                                    await bot.send_message(user.telegram_id, f"Vous avez été retiré pour absence de premier média. Vous pouvez revenir pour {settings.reentry_price_eur} €, ou choisir l’accès permanent à {settings.lifetime_reentry_price_eur} € sans obligation de média.", reply_markup=recovery_payment_keyboard(recovery.id))
-                                    recovery.contacted_at = now
-                                    recovery.last_contact_error = None
+                                    await bot.send_message(
+                                        user.telegram_id,
+                                        f"❌ <b>Accès retiré pour inactivité</b>\n\nSeulement <b>{count}/{settings.activity_media_target}</b> médias ont été comptabilisés. "
+                                        f"Vous pouvez demander à revenir avec une participation de <b>{settings.reentry_price_eur} €</b>.",
+                                        reply_markup=kb([
+                                        (f"🔄 Demander mon retour — {settings.reentry_price_eur} €", "reentry:start"),
+                                        (f"♾ Retour Lifetime — {settings.lifetime_price_eur} €", "reentry:lifetime"),
+                                        ("📜 Consulter les règles", "rules:show"),
+                                    ]),
+                                    )
                                 except Exception as exc:
-                                    recovery.last_contact_error = repr(exc)[:1000]
-                                    logger.exception("Impossible de contacter utilisateur impacté user=%s", user.telegram_id)
-                        elif age>=timedelta(hours=settings.activity_window_hours):
-                            count=await activity_count(s,m.id)
-                            if count<settings.activity_media_target:
-                                try: await bot.ban_chat_member(chat.telegram_chat_id,user.telegram_id); await bot.unban_chat_member(chat.telegram_chat_id,user.telegram_id,only_if_banned=True); await bot.send_message(user.telegram_id,"Vous avez été exclu pour activité insuffisante.")
-                                except Exception: pass
+                                    print("activity exclusion notification error", user.telegram_id, repr(exc))
                                 m.active=False
-                    # Rattrapage des personnes déjà exclues avant cette version.
-                    impacted_memberships = list((await s.scalars(select(Membership).where(Membership.active.is_(False), Membership.first_media_at.is_(None)))).all())
-                    for impacted_m in impacted_memberships:
-                        recovery = await s.scalar(select(MembershipRecovery).where(MembershipRecovery.membership_id == impacted_m.id))
-                        if not recovery:
-                            recovery = MembershipRecovery(membership_id=impacted_m.id, reason="missing_first_media", removed_at=now)
-                            s.add(recovery)
-                            await s.flush()
-                        elif recovery.removed_at is None:
-                            # Ancien cycle déjà terminé : cette nouvelle expulsion ouvre
-                            # un nouveau parcours payant et doit être visible dans Santé.
-                            recovery.removed_at = now
-                            recovery.rejoined_at = None
-                            recovery.contacted_at = None
-                            recovery.last_contact_error = None
-                        if recovery.rejoined_at is None and recovery.contacted_at is None:
-                            impacted_user = await s.get(User, impacted_m.user_id)
-                            req, _ = await paid_access_state(s, impacted_user.id)
-                            if req and impacted_user.started_bot:
-                                recovery.contact_attempts += 1
-                                try:
-                                    await bot.send_message(impacted_user.telegram_id, f"Vous avez été retiré pour absence de premier média. Vous pouvez revenir pour {settings.reentry_price_eur} €, ou choisir l’accès permanent à {settings.lifetime_reentry_price_eur} € sans obligation de média.", reply_markup=recovery_payment_keyboard(recovery.id))
-                                    recovery.contacted_at = now
-                                    recovery.last_contact_error = None
-                                except Exception as exc:
-                                    recovery.last_contact_error = repr(exc)[:1000]
                     await s.commit()
             health_tick += 1
             if health_tick >= 5:
@@ -1133,7 +896,7 @@ async def welcome_config_screen(c: CallbackQuery):
         text_value = await get_setting(s, "welcome_text", DEFAULT_WELCOME_TEXT)
         photo = await get_setting(s, "welcome_photo_file_id", "")
     preview = text_value[:700] + ("…" if len(text_value) > 700 else "")
-    await edit_message(c.message, 
+    await c.message.edit_text(
         "<b>🖼 Configuration de l’accueil</b>\n\n"
         f"Image : <b>{'configurée' if photo else 'aucune'}</b>\n\n"
         f"<b>Texte actuel :</b>\n{preview}",
@@ -1148,44 +911,44 @@ async def welcome_config_screen(c: CallbackQuery):
 
 @r.callback_query(F.data == "admin:welcome")
 async def admin_welcome(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    await welcome_config_screen(c); await safe_callback_answer(c)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    await welcome_config_screen(c); await c.answer()
 
 @r.callback_query(F.data == "admin:welcome_text")
 async def admin_welcome_text(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     ADMIN_INPUT_MODE[c.from_user.id] = "welcome_text"
-    await edit_message(c.message, "Envoyez maintenant le nouveau texte d’accueil en message privé. HTML simple accepté.\n\nEnvoyez /annuler pour quitter.")
-    await safe_callback_answer(c)
+    await c.message.edit_text("Envoyez maintenant le nouveau texte d’accueil en message privé. HTML simple accepté.\n\nEnvoyez /annuler pour quitter.")
+    await c.answer()
 
 @r.callback_query(F.data == "admin:welcome_photo")
 async def admin_welcome_photo(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     ADMIN_INPUT_MODE[c.from_user.id] = "welcome_photo"
-    await edit_message(c.message, "Envoyez maintenant l’image d’accueil en tant que photo.\n\nEnvoyez /annuler pour quitter.")
-    await safe_callback_answer(c)
+    await c.message.edit_text("Envoyez maintenant l’image d’accueil en tant que photo.\n\nEnvoyez /annuler pour quitter.")
+    await c.answer()
 
 @r.callback_query(F.data == "admin:welcome_photo_remove")
 async def admin_welcome_photo_remove(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     async with SessionLocal() as s: await set_setting(s, "welcome_photo_file_id", "")
-    await safe_callback_answer(c, "Image retirée"); await welcome_config_screen(c)
+    await c.answer("Image retirée"); await welcome_config_screen(c)
 
 @r.callback_query(F.data == "admin:welcome_preview")
 async def admin_welcome_preview(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     async with SessionLocal() as s:
         text_value=await get_setting(s,"welcome_text",DEFAULT_WELCOME_TEXT); photo=await get_setting(s,"welcome_photo_file_id","")
     markup=kb([("📜 Consulter les règles","rules:show")])
     if photo: await bot.send_photo(c.from_user.id, photo, caption=text_value, reply_markup=markup)
     else: await bot.send_message(c.from_user.id, text_value, reply_markup=markup)
-    await safe_callback_answer(c, "Prévisualisation envoyée")
+    await c.answer("Prévisualisation envoyée")
 
 async def pub_config_screen(c: CallbackQuery):
     async with SessionLocal() as s:
         text_value=await get_setting(s,"pub_ad_text",DEFAULT_PUB_AD_TEXT); photo=await get_setting(s,"pub_ad_photo_file_id","")
     preview=text_value[:700]+("…" if len(text_value)>700 else "")
-    await edit_message(c.message, 
+    await c.message.edit_text(
         "<b>📣 Publicité des groupes PUB</b>\n\n"
         f"Image : <b>{'configurée' if photo else 'aucune'}</b>\n\n<b>Texte actuel :</b>\n{preview}",
         reply_markup=kb([
@@ -1200,46 +963,46 @@ async def pub_config_screen(c: CallbackQuery):
 
 @r.callback_query(F.data == "admin:pub_ad")
 async def admin_pub_ad(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    await pub_config_screen(c); await safe_callback_answer(c)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    await pub_config_screen(c); await c.answer()
 
 @r.callback_query(F.data == "admin:pub_text")
 async def admin_pub_text(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     ADMIN_INPUT_MODE[c.from_user.id] = "pub_text"
-    await edit_message(c.message, "Envoyez maintenant le texte de la publicité PUB.\n\nEnvoyez /annuler pour quitter.")
-    await safe_callback_answer(c)
+    await c.message.edit_text("Envoyez maintenant le texte de la publicité PUB.\n\nEnvoyez /annuler pour quitter.")
+    await c.answer()
 
 @r.callback_query(F.data == "admin:pub_photo")
 async def admin_pub_photo(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     ADMIN_INPUT_MODE[c.from_user.id] = "pub_photo"
-    await edit_message(c.message, "Envoyez maintenant l’image de la publicité PUB en tant que photo.\n\nEnvoyez /annuler pour quitter.")
-    await safe_callback_answer(c)
+    await c.message.edit_text("Envoyez maintenant l’image de la publicité PUB en tant que photo.\n\nEnvoyez /annuler pour quitter.")
+    await c.answer()
 
 @r.callback_query(F.data == "admin:pub_photo_remove")
 async def admin_pub_photo_remove(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     async with SessionLocal() as s: await set_setting(s,"pub_ad_photo_file_id","")
-    await safe_callback_answer(c, "Image retirée"); await pub_config_screen(c)
+    await c.answer("Image retirée"); await pub_config_screen(c)
 
 @r.callback_query(F.data == "admin:pub_preview")
 async def admin_pub_preview(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     async with SessionLocal() as s:
         text_value=await get_setting(s,"pub_ad_text",DEFAULT_PUB_AD_TEXT); photo=await get_setting(s,"pub_ad_photo_file_id","")
     markup=kb([("🚀 Demander mon accès","rules:show")])
     if photo: await bot.send_photo(c.from_user.id,photo,caption=text_value,reply_markup=markup)
     else: await bot.send_message(c.from_user.id,text_value,reply_markup=markup)
-    await safe_callback_answer(c, "Prévisualisation envoyée")
+    await c.answer("Prévisualisation envoyée")
 
 @r.callback_query(F.data == "admin:pub_send")
 async def admin_pub_send(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     async with SessionLocal() as s:
         chats=list((await s.scalars(select(TelegramChat).where(TelegramChat.role=="pub",TelegramChat.active.is_(True)))).all())
         text_value=await get_setting(s,"pub_ad_text",DEFAULT_PUB_AD_TEXT); photo=await get_setting(s,"pub_ad_photo_file_id","")
-    if not chats: return await safe_callback_answer(c, "Aucun groupe PUB actif", show_alert=True)
+    if not chats: return await c.answer("Aucun groupe PUB actif", show_alert=True)
     me=await bot.get_me(); markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Demander mon accès",url=f"https://t.me/{me.username}?start=pub")]])
     sent=failed=0
     for chat in chats:
@@ -1248,7 +1011,7 @@ async def admin_pub_send(c: CallbackQuery):
             else: await bot.send_message(chat.telegram_chat_id,text_value,reply_markup=markup)
             sent+=1
         except Exception: failed+=1
-    await safe_callback_answer(c, f"Envoyée : {sent} | Échecs : {failed}", show_alert=True)
+    await c.answer(f"Envoyée : {sent} | Échecs : {failed}", show_alert=True)
 
 # --- Extensions production : files d'attente, broadcast, statistiques et navigation ---
 BROADCAST_WAITING: set[int] = set()
@@ -1256,21 +1019,14 @@ BROADCAST_WAITING: set[int] = set()
 @r.callback_query(F.data == "menu")
 async def back_to_menu(c: CallbackQuery):
     async with SessionLocal() as s:
-        user = await get_or_create_user(s, c.from_user)
-        paid_req, link_used = await paid_access_state(s, user.id)
-        recovery = await recovery_for_user(s, user.id)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
-    if paid_req:
-        await show_existing_paid_access(c.message, paid_req, link_used, recovery)
-        await safe_callback_answer(c)
-        return
-    await edit_message(c.message, "Choisissez votre méthode d’accès :" if enabled else "L’accès au groupe est actuellement disponible uniquement par paiement.", reply_markup=access_methods(enabled))
-    await safe_callback_answer(c)
+    await c.message.edit_text("Choisissez votre méthode d’accès :" if enabled else "L’accès au groupe est actuellement disponible uniquement par paiement.", reply_markup=access_methods(enabled))
+    await c.answer()
 
 @r.callback_query(F.data == "rules:quit")
 async def quit_rules(c: CallbackQuery):
-    await edit_message(c.message, "Vous n’avez pas accepté le règlement. Aucun accès ne peut être créé.\n\nVous pouvez revenir avec /start.")
-    await safe_callback_answer(c)
+    await c.message.edit_text("Vous n’avez pas accepté le règlement. Aucun accès ne peut être créé.\n\nVous pouvez revenir avec /start.")
+    await c.answer()
 
 async def pending_requests_text(method: str) -> tuple[str, InlineKeyboardMarkup]:
     async with SessionLocal() as s:
@@ -1288,31 +1044,31 @@ async def pending_requests_text(method: str) -> tuple[str, InlineKeyboardMarkup]
 
 @r.callback_query(F.data == "admin:payments")
 async def admin_payments(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     text_, markup = await pending_requests_text(AccessMethod.payment.value)
-    await edit_message(c.message, text_, reply_markup=markup); await safe_callback_answer(c)
+    await c.message.edit_text(text_, reply_markup=markup); await c.answer()
 
 @r.callback_query(F.data == "admin:media_reviews")
 async def admin_media_queue(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     text_, markup = await pending_requests_text(AccessMethod.media.value)
-    await edit_message(c.message, text_, reply_markup=markup); await safe_callback_answer(c)
+    await c.message.edit_text(text_, reply_markup=markup); await c.answer()
 
 @r.callback_query(F.data.startswith("admin:pending_pay:"))
 async def pending_pay_detail(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     req_id=int(c.data.rsplit(":",1)[1])
     async with SessionLocal() as s:
         req=await s.get(AccessRequest, req_id); user=await s.get(User, req.user_id) if req else None
         proof=await s.scalar(select(PaymentProof).where(PaymentProof.request_id==req_id).order_by(PaymentProof.id.desc()))
-    if not req or not proof: return await safe_callback_answer(c, "Demande introuvable", show_alert=True)
+    if not req or not proof: return await c.answer("Demande introuvable", show_alert=True)
     caption=f"<b>Paiement #{req.id}</b>\nUtilisateur : {user.first_name} @{user.username or '-'}\nID : <code>{user.telegram_id}</code>\nRéférence : <code>{req.reference}</code>"
     await bot.send_photo(c.from_user.id, proof.file_id, caption=caption, reply_markup=kb([("✅ Valider",f"review:pay:ok:{req.id}"),("❌ Refuser",f"review:pay:no:{req.id}")]))
-    await safe_callback_answer(c, "Justificatif envoyé en privé")
+    await c.answer("Justificatif envoyé en privé")
 
 @r.callback_query(F.data.startswith("admin:pending_media:"))
 async def pending_media_detail(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     req_id=int(c.data.rsplit(":",1)[1])
     async with SessionLocal() as s:
         files=list((await s.scalars(select(MediaSubmission).where(MediaSubmission.request_id==req_id))).all())
@@ -1321,167 +1077,18 @@ async def pending_media_detail(c: CallbackQuery):
         try:
             await (bot.send_photo(c.from_user.id,f.file_id) if f.media_type=="photo" else bot.send_video(c.from_user.id,f.file_id))
         except Exception: pass
-    await safe_callback_answer(c, "Dossier envoyé en privé")
+    await c.answer("Dossier envoyé en privé")
 
 @r.callback_query(F.data == "admin:broadcast")
 async def broadcast_start(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     BROADCAST_WAITING.add(c.from_user.id)
-    await edit_message(c.message, "<b>Broadcast</b>\n\nEnvoyez maintenant en message privé le texte à transmettre à tous les utilisateurs ayant démarré le bot.\n\nEnvoyez /annuler pour quitter.", reply_markup=kb([("⬅️ Annuler", "admin:broadcast_cancel")]))
-    await safe_callback_answer(c)
+    await c.message.edit_text("<b>Broadcast</b>\n\nEnvoyez maintenant en message privé le texte à transmettre à tous les utilisateurs ayant démarré le bot.\n\nEnvoyez /annuler pour quitter.", reply_markup=kb([("⬅️ Annuler", "admin:broadcast_cancel")]))
+    await c.answer()
 
 @r.callback_query(F.data == "admin:broadcast_cancel")
 async def broadcast_cancel_button(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    BROADCAST_WAITING.discard(c.from_user.id); await render_admin_panel(c.message, edit=True); await safe_callback_answer(c, "Annulé")
-
-
-async def moderation_home_screen(message: Message):
-    async with SessionLocal() as s:
-        fw = (await get_setting(s, "forbidden_words_enabled", "0")) == "1"
-        al = (await get_setting(s, "anti_links_enabled", "0")) == "1"
-        ar = (await get_setting(s, "anti_repost_enabled", "0")) == "1"
-        sysmsg = (await get_setting(s, "delete_system_messages", "1")) == "1"
-    await edit_or_send(message, "<b>🛡 Modération</b>\n\nToutes les protections sont stockées en PostgreSQL et configurables ici.", reply_markup=kb([
-        (f"🚫 Mots interdits — {'ON' if fw else 'OFF'}", "mod:words"),
-        (f"🔗 Anti-liens — {'ON' if al else 'OFF'}", "mod:links"),
-        (f"♻️ Anti-repost — {'ON' if ar else 'OFF'}", "mod:repost"),
-        (f"🧹 Messages système — {'ON' if sysmsg else 'OFF'}", "mod:system"),
-        ("⚠️ Sanctions", "mod:sanctions"),
-        ("📊 Statistiques", "mod:stats"),
-        ("⬅ Retour", "admin:home"), ("🏠 Menu", "menu")
-    ]))
-
-@r.callback_query(F.data == "mod:home")
-async def moderation_home(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    await moderation_home_screen(c.message); await safe_callback_answer(c)
-
-@r.callback_query(F.data == "mod:words")
-async def moderation_words(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    async with SessionLocal() as s:
-        enabled=(await get_setting(s,"forbidden_words_enabled","0"))=="1"
-        sanction=await get_setting(s,"forbidden_words_sanction","warning")
-        words=list((await s.scalars(select(ForbiddenWord).order_by(ForbiddenWord.word))).all())
-    listing="\n".join(f"• {escape(w.word)} {'✅' if w.active else '⏸'}" for w in words[:50]) or "Aucun mot enregistré."
-    await edit_or_send(c.message, f"<b>🚫 Mots interdits</b>\n\nÉtat : <b>{'ON' if enabled else 'OFF'}</b>\nSanction : <b>{sanction}</b>\n\n{listing}", reply_markup=kb([
-        ("Désactiver" if enabled else "Activer", "mod:words:toggle"), ("➕ Ajouter", "mod:words:add"), ("➖ Supprimer", "mod:words:remove"), ("⚠️ Changer sanction", "mod:words:sanction"), ("⬅ Retour", "mod:home"), ("🏠 Menu", "menu")]))
-    await safe_callback_answer(c)
-
-@r.callback_query(F.data == "mod:words:toggle")
-async def moderation_words_toggle(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    async with SessionLocal() as s:
-        cur=(await get_setting(s,"forbidden_words_enabled","0"))=="1"; await set_setting(s,"forbidden_words_enabled","0" if cur else "1")
-    await moderation_words(c)
-
-@r.callback_query(F.data.in_({"mod:words:add","mod:words:remove"}))
-async def moderation_words_input(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    ADMIN_INPUT_MODE[c.from_user.id]="forbidden_add" if c.data.endswith("add") else "forbidden_remove"
-    await edit_or_send(c.message,"Envoyez le mot ou l’expression. Envoyez /annuler pour quitter.",reply_markup=kb([("⬅ Retour","mod:words"),("🏠 Menu","menu")]))
-    await safe_callback_answer(c)
-
-@r.callback_query(F.data == "mod:words:sanction")
-async def words_sanction(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    await edit_or_send(c.message,"Choisissez la sanction appliquée aux mots interdits.",reply_markup=kb([(x.title(),f"mod:set:forbidden_words_sanction:{x}") for x in ["delete","warning","mute","kick","ban"]]+[("⬅ Retour","mod:words")]))
-    await safe_callback_answer(c)
-
-@r.callback_query(F.data == "mod:links")
-async def moderation_links(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    async with SessionLocal() as s:
-        vals={k:(await get_setting(s,k,d))=="1" for k,d in [("anti_links_enabled","0"),("anti_links_allow_telegram","0"),("anti_links_allow_tme","0"),("anti_links_allow_http","0"),("anti_links_allow_https","0"),("anti_links_allow_admins","1")]}
-        sanction=await get_setting(s,"anti_links_sanction","warning")
-        domains=list((await s.scalars(select(LinkWhitelistDomain).order_by(LinkWhitelistDomain.domain))).all())
-        users=list((await s.scalars(select(LinkWhitelistUser).order_by(LinkWhitelistUser.telegram_id))).all())
-    info=f"<b>🔗 Anti-liens</b>\n\nSanction : <b>{sanction}</b>\nDomaines whitelist : <b>{len(domains)}</b>\nUtilisateurs whitelist : <b>{len(users)}</b>"
-    rows=[(f"Protection {'ON' if vals['anti_links_enabled'] else 'OFF'}","mod:linktoggle:anti_links_enabled"),(f"Telegram {'✅' if vals['anti_links_allow_telegram'] else '❌'}","mod:linktoggle:anti_links_allow_telegram"),(f"t.me {'✅' if vals['anti_links_allow_tme'] else '❌'}","mod:linktoggle:anti_links_allow_tme"),(f"HTTP {'✅' if vals['anti_links_allow_http'] else '❌'}","mod:linktoggle:anti_links_allow_http"),(f"HTTPS {'✅' if vals['anti_links_allow_https'] else '❌'}","mod:linktoggle:anti_links_allow_https"),(f"Admins {'✅' if vals['anti_links_allow_admins'] else '❌'}","mod:linktoggle:anti_links_allow_admins"),("➕ Domaine whitelist","mod:domain:add"),("➖ Domaine whitelist","mod:domain:remove"),("➕ Utilisateur whitelist","mod:user:add"),("➖ Utilisateur whitelist","mod:user:remove"),("⚠️ Sanction","mod:links:sanction"),("⬅ Retour","mod:home"),("🏠 Menu","menu")]
-    await edit_or_send(c.message,info,reply_markup=kb(rows)); await safe_callback_answer(c)
-
-@r.callback_query(F.data.startswith("mod:linktoggle:"))
-async def link_toggle(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    key=c.data.rsplit(":",1)[1]
-    async with SessionLocal() as s:
-        cur=(await get_setting(s,key,"0"))=="1"; await set_setting(s,key,"0" if cur else "1")
-    await moderation_links(c)
-
-@r.callback_query(F.data.in_({"mod:domain:add","mod:domain:remove","mod:user:add","mod:user:remove"}))
-async def whitelist_input(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    ADMIN_INPUT_MODE[c.from_user.id]=c.data.replace("mod:","").replace(":","_")
-    await edit_or_send(c.message,"Envoyez la valeur à ajouter ou supprimer. Pour un utilisateur, envoyez son ID Telegram numérique.",reply_markup=kb([("⬅ Retour","mod:links")]))
-    await safe_callback_answer(c)
-
-@r.callback_query(F.data == "mod:links:sanction")
-async def links_sanction(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    await edit_or_send(c.message,"Choisissez la sanction anti-liens.",reply_markup=kb([(x.title(),f"mod:set:anti_links_sanction:{x}") for x in ["delete","warning","mute","kick","ban"]]+[("⬅ Retour","mod:links")]))
-    await safe_callback_answer(c)
-
-@r.callback_query(F.data.startswith("mod:set:"))
-async def set_moderation_value(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    _,_,key,value=c.data.split(":",3)
-    async with SessionLocal() as s: await set_setting(s,key,value)
-    await (moderation_words(c) if key.startswith("forbidden") else moderation_links(c))
-
-@r.callback_query(F.data == "mod:repost")
-async def moderation_repost(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    async with SessionLocal() as s:
-        enabled=(await get_setting(s,"anti_repost_enabled","0"))=="1"; auto=(await get_setting(s,"anti_repost_auto_delete","1"))=="1"
-        count=int(await s.scalar(select(func.count(MediaHash.id))) or 0); dup=int((await s.get(ModerationStat,"reposts_detected")).value if await s.get(ModerationStat,"reposts_detected") else 0)
-    await edit_or_send(c.message,f"<b>♻️ Anti-repost</b>\n\nÉtat : <b>{'ON' if enabled else 'OFF'}</b>\nSuppression automatique : <b>{'ON' if auto else 'OFF'}</b>\nHash enregistrés : <b>{count}</b>\nDoublons détectés : <b>{dup}</b>",reply_markup=kb([("Désactiver" if enabled else "Activer","mod:repost:toggle"),("Suppression auto ON/OFF","mod:repost:delete"),("✏️ Modifier le message","mod:repost:message"),("🗑 Vider les hash","mod:repost:clear"),("⬅ Retour","mod:home"),("🏠 Menu","menu")]))
-    await safe_callback_answer(c)
-
-@r.callback_query(F.data.in_({"mod:repost:toggle","mod:repost:delete"}))
-async def repost_toggle(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    key="anti_repost_enabled" if c.data.endswith("toggle") else "anti_repost_auto_delete"
-    async with SessionLocal() as s:
-        cur=(await get_setting(s,key,"0"))=="1"; await set_setting(s,key,"0" if cur else "1")
-    await moderation_repost(c)
-
-@r.callback_query(F.data == "mod:repost:message")
-async def repost_message_input(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    ADMIN_INPUT_MODE[c.from_user.id]="anti_repost_message"
-    await edit_or_send(c.message,"Envoyez le nouveau message. Utilisez {user} pour la mention.",reply_markup=kb([("⬅ Retour","mod:repost")]))
-    await safe_callback_answer(c)
-
-@r.callback_query(F.data == "mod:repost:clear")
-async def repost_clear(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    async with SessionLocal() as s:
-        await s.execute(__import__('sqlalchemy').delete(MediaHash)); await s.commit()
-    await moderation_repost(c)
-
-@r.callback_query(F.data == "mod:system")
-async def system_toggle(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    async with SessionLocal() as s:
-        cur=(await get_setting(s,"delete_system_messages","1"))=="1"; await set_setting(s,"delete_system_messages","0" if cur else "1")
-    await safe_callback_answer(c, "Réglage modifié",show_alert=True); await moderation_home_screen(c.message)
-
-@r.callback_query(F.data == "mod:sanctions")
-async def sanctions_screen(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    async with SessionLocal() as s:
-        fw=await get_setting(s,"forbidden_words_sanction","warning"); links=await get_setting(s,"anti_links_sanction","warning")
-    await edit_or_send(c.message,f"<b>⚠️ Sanctions</b>\n\nMots interdits : <b>{fw}</b>\nAnti-liens : <b>{links}</b>\n\nMute : 1 heure.",reply_markup=kb([("🚫 Mots interdits","mod:words:sanction"),("🔗 Anti-liens","mod:links:sanction"),("⬅ Retour","mod:home")]))
-    await safe_callback_answer(c)
-
-@r.callback_query(F.data == "mod:stats")
-async def moderation_stats(c: CallbackQuery):
-    if not is_owner_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
-    async with SessionLocal() as s:
-        stats={x.key:x.value for x in (await s.scalars(select(ModerationStat))).all()}; hashes=int(await s.scalar(select(func.count(MediaHash.id))) or 0)
-    await edit_or_send(c.message,f"<b>📊 Statistiques modération</b>\n\nMots bloqués : <b>{stats.get('forbidden_words_blocked',0)}</b>\nLiens bloqués : <b>{stats.get('links_blocked',0)}</b>\nDoublons détectés : <b>{stats.get('reposts_detected',0)}</b>\nHash médias : <b>{hashes}</b>",reply_markup=kb([("🔄 Actualiser","mod:stats"),("⬅ Retour","mod:home"),("🏠 Menu","menu")]))
-    await safe_callback_answer(c)
+    BROADCAST_WAITING.discard(c.from_user.id); await render_admin_panel(c.message, edit=True); await c.answer("Annulé")
 
 @r.message(F.chat.type == "private", F.text)
 async def broadcast_text(message: Message):
@@ -1491,39 +1098,11 @@ async def broadcast_text(message: Message):
             ADMIN_INPUT_MODE.pop(message.from_user.id, None)
             await message.answer("Configuration annulée.", reply_markup=kb([("⚙️ Panneau administrateur", "admin:home")]))
             return
-        if mode in {"welcome_text", "pub_text", "anti_repost_message"}:
-            key = {"welcome_text": "welcome_text", "pub_text": "pub_ad_text", "anti_repost_message": "anti_repost_message"}[mode]
+        if mode in {"welcome_text", "pub_text"}:
+            key = "welcome_text" if mode == "welcome_text" else "pub_ad_text"
             async with SessionLocal() as s: await set_setting(s, key, message.text)
             ADMIN_INPUT_MODE.pop(message.from_user.id, None)
-            await message.answer("✅ Texte enregistré.", reply_markup=kb([("⬅ Retour", "mod:repost" if mode == "anti_repost_message" else "admin:home"), ("🏠 Menu", "menu")]))
-            return
-        if mode in {"forbidden_add", "forbidden_remove", "domain_add", "domain_remove", "user_add", "user_remove"}:
-            value = message.text.strip()
-            async with SessionLocal() as s:
-                if mode == "forbidden_add":
-                    row = await s.scalar(select(ForbiddenWord).where(func.lower(ForbiddenWord.word) == value.lower()))
-                    if row: row.active = True
-                    else: s.add(ForbiddenWord(word=value, active=True))
-                elif mode == "forbidden_remove":
-                    row = await s.scalar(select(ForbiddenWord).where(func.lower(ForbiddenWord.word) == value.lower()))
-                    if row: await s.delete(row)
-                elif mode == "domain_add":
-                    domain = value.lower().replace("https://", "").replace("http://", "").split("/")[0].lstrip("www.")
-                    if not await s.scalar(select(LinkWhitelistDomain).where(LinkWhitelistDomain.domain == domain)): s.add(LinkWhitelistDomain(domain=domain))
-                elif mode == "domain_remove":
-                    domain = value.lower().replace("https://", "").replace("http://", "").split("/")[0].lstrip("www.")
-                    row = await s.scalar(select(LinkWhitelistDomain).where(LinkWhitelistDomain.domain == domain))
-                    if row: await s.delete(row)
-                else:
-                    try: uid = int(value)
-                    except ValueError:
-                        await message.answer("ID Telegram invalide."); return
-                    row = await s.scalar(select(LinkWhitelistUser).where(LinkWhitelistUser.telegram_id == uid))
-                    if mode == "user_add" and not row: s.add(LinkWhitelistUser(telegram_id=uid))
-                    elif mode == "user_remove" and row: await s.delete(row)
-                await s.commit()
-            ADMIN_INPUT_MODE.pop(message.from_user.id, None)
-            await message.answer("✅ Configuration enregistrée.", reply_markup=kb([("⬅ Retour", "mod:words" if mode.startswith("forbidden") else "mod:links"), ("🏠 Menu", "menu")]))
+            await message.answer("✅ Texte enregistré.", reply_markup=kb([("⚙️ Panneau administrateur", "admin:home")]))
             return
     if message.from_user.id not in BROADCAST_WAITING: return
     if message.text.strip().lower() in {"/annuler","annuler"}:
@@ -1545,15 +1124,15 @@ async def broadcast_text(message: Message):
 
 @r.callback_query(F.data == "admin:stats")
 async def admin_stats(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await safe_callback_answer(c, "Accès refusé", show_alert=True)
+    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     async with SessionLocal() as s:
         users=int(await s.scalar(select(func.count(User.id))) or 0)
         active=int(await s.scalar(select(func.count(Membership.id)).where(Membership.active.is_(True))) or 0)
         pending_pay=int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.method==AccessMethod.payment.value,AccessRequest.status==AccessStatus.pending_review.value)) or 0)
         pending_media=int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.method==AccessMethod.media.value,AccessRequest.status==AccessStatus.pending_review.value)) or 0)
         approved=int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.status.in_([AccessStatus.approved.value,AccessStatus.member.value]))) or 0)
-    await edit_message(c.message, f"<b>📊 Statistiques</b>\n\nUtilisateurs enregistrés : <b>{users}</b>\nMembres VIP actifs : <b>{active}</b>\nAccès validés : <b>{approved}</b>\nPaiements à vérifier : <b>{pending_pay}</b>\nDossiers à vérifier : <b>{pending_media}</b>", reply_markup=kb([("🔄 Actualiser","admin:stats"),("⬅️ Retour","admin:home")]))
-    await safe_callback_answer(c)
+    await c.message.edit_text(f"<b>📊 Statistiques</b>\n\nUtilisateurs enregistrés : <b>{users}</b>\nMembres VIP actifs : <b>{active}</b>\nAccès validés : <b>{approved}</b>\nPaiements à vérifier : <b>{pending_pay}</b>\nDossiers à vérifier : <b>{pending_media}</b>", reply_markup=kb([("🔄 Actualiser","admin:stats"),("⬅️ Retour","admin:home")]))
+    await c.answer()
 
 
 @r.error()
@@ -1565,31 +1144,22 @@ async def global_error_handler(event: ErrorEvent):
         if update.callback_query:
             callback = update.callback_query
             with suppress(Exception):
-                admin_user = await is_admin(callback.from_user.id)
-                await safe_callback_answer(callback,
-                    "Une erreur est survenue. Ouvrez Santé du système ou réessayez."
-                    if admin_user else
-                    "Une erreur temporaire est survenue. Veuillez réessayer.",
+                await callback.answer(
+                    "Une erreur est survenue. Ouvrez Santé du système ou réessayez.",
                     show_alert=True,
                 )
             if callback.message:
                 with suppress(Exception):
-                    if await is_admin(callback.from_user.id):
-                        await callback.message.answer(
-                            "⚠️ <b>Le bot a rencontré une erreur</b>\n\n"
-                            "L’action n’a pas été appliquée. Vous pouvez relancer le diagnostic depuis le panneau administrateur.",
-                            reply_markup=kb([("🩺 Santé du système", "admin:health"), ("🏠 Panneau admin", "admin:home")]),
-                        )
-                    else:
-                        await callback.message.answer(
-                            "⚠️ <b>Une erreur temporaire est survenue</b>\n\n"
-                            "L’action n’a pas été appliquée. Veuillez réessayer dans quelques instants."
-                        )
+                    await callback.message.answer(
+                        "⚠️ <b>Le bot a rencontré une erreur</b>\n\n"
+                        "L’action n’a pas été appliquée. Vous pouvez relancer le diagnostic depuis le panneau administrateur.",
+                        reply_markup=kb([("🩺 Santé du système", "admin:health"), ("🏠 Panneau admin", "admin:home")]),
+                    )
         elif update.message:
             with suppress(Exception):
                 await update.message.answer(
                     "⚠️ Une erreur temporaire est survenue. Votre demande n’a pas été perdue. Réessayez dans quelques instants."
                 )
     finally:
-        logger.exception("Erreur callback/Telegram non gérée: %s", exc, exc_info=exc)
+        print(f"Unhandled bot error: {type(exc).__name__}: {exc}")
     return True
