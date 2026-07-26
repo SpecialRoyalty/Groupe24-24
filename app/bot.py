@@ -11,7 +11,7 @@ from sqlalchemy import select, func, text
 from .config import get_settings
 from .db import SessionLocal
 from .keyboards import access_methods, admin_home, kb, payment_keyboard, rules_keyboard
-from .models import AccessMethod, AccessRequest, AccessStatus, ActivityMedia, Invite, MediaSubmission, Membership, PaymentProof, Referral, TelegramChat, User
+from .models import AccessMethod, AccessRequest, AccessStatus, ActivityMedia, Invite, MediaSubmission, Membership, PaymentProof, Referral, Setting, TelegramChat, User
 from .services import active_request, activity_count, create_personal_invite, create_request, get_or_create_user, get_setting, pub_chat, set_group_open, set_setting, validated_referrals, vip_chat
 
 settings = get_settings()
@@ -535,7 +535,6 @@ async def join_request(j: ChatJoinRequest):
             membership.joined_at = datetime.now(timezone.utc)
             membership.first_media_at = None
             membership.warned_first_day = False
-            membership.warned_first_final = False
             membership.warned_activity = False
         # Un dossier accepté est publié à l'entrée et compte comme première participation.
         if req.method == AccessMethod.media.value:
@@ -803,18 +802,24 @@ async def maintenance_loop():
                                 m.warned_first_day = True
                             except Exception as exc:
                                 print("first media reminder error", user.telegram_id, repr(exc))
-                        if not m.first_media_at and not m.warned_first_final and now >= final_reminder_at and now < first_deadline:
-                            minutes = max(1, int((first_deadline - now).total_seconds() // 60) + 1)
-                            try:
-                                await bot.send_message(
-                                    user.telegram_id,
-                                    f"🚨 <b>Dernier rappel</b>\n\nVous n’avez toujours pas publié votre premier média. "
-                                    f"Il vous reste environ <b>{minutes} minute(s)</b> avant le retrait automatique.",
-                                    reply_markup=kb([("📊 Voir mon statut", "member:status")]),
-                                )
-                                m.warned_first_final = True
-                            except Exception as exc:
-                                print("final first media reminder error", user.telegram_id, repr(exc))
+                        # Le dernier rappel est mémorisé dans la table générique `settings`.
+                        # Cela évite d'exiger une nouvelle colonne dans `memberships` et reste
+                        # compatible avec les bases créées par les anciennes versions du bot.
+                        if not m.first_media_at and now >= final_reminder_at and now < first_deadline:
+                            reminder_key = f"first_final:{m.id}:{int(m.joined_at.timestamp())}"
+                            final_already_sent = await s.get(Setting, reminder_key) is not None
+                            if not final_already_sent:
+                                minutes = max(1, int((first_deadline - now).total_seconds() // 60) + 1)
+                                try:
+                                    await bot.send_message(
+                                        user.telegram_id,
+                                        f"🚨 <b>Dernier rappel</b>\n\nVous n’avez toujours pas publié votre premier média. "
+                                        f"Il vous reste environ <b>{minutes} minute(s)</b> avant le retrait automatique.",
+                                        reply_markup=kb([("📊 Voir mon statut", "member:status")]),
+                                    )
+                                    s.add(Setting(key=reminder_key, value="1"))
+                                except Exception as exc:
+                                    print("final first media reminder error", user.telegram_id, repr(exc))
                         if not m.first_media_at and now >= first_deadline:
                             try:
                                 await bot.ban_chat_member(chat.telegram_chat_id,user.telegram_id)

@@ -40,7 +40,6 @@ async def initialise_dependencies() -> None:
                 await conn.run_sync(Base.metadata.create_all)
                 # Migrations légères et idempotentes pour les bases Railway existantes.
                 await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS has_lifetime_reentry BOOLEAN NOT NULL DEFAULT FALSE"))
-                await conn.execute(text("ALTER TABLE memberships ADD COLUMN IF NOT EXISTS warned_first_final BOOLEAN NOT NULL DEFAULT FALSE"))
             STARTUP_STATE["database"] = "ok"
         except asyncio.CancelledError:
             raise
