@@ -100,7 +100,17 @@ Lorsqu'il est ajouté à un groupe, le bot n'envoie aucun message dans ce groupe
 
 ## Retour Lifetime et audit automatique
 
-- `LIFETIME_PRICE_EUR` définit le prix de l’option Lifetime (25 € par défaut).
+- `LIFETIME_REENTRY_PRICE_EUR` définit le prix de l’option Lifetime (10 € par défaut).
 - Un membre Lifetime retiré pour inactivité peut demander un nouveau lien sans repayer. Les obligations de participation restent applicables.
 - À chaque démarrage réussi, le bot compare PostgreSQL au statut Telegram, corrige les anciens membres marqués actifs à tort, contacte une seule fois les personnes concernées et envoie un bilan aux identifiants de `ADMIN_IDS`.
 - Les utilisateurs doivent avoir déjà lancé le bot en privé pour pouvoir être contactés.
+
+
+## Retour et rappels
+
+- `REENTRY_PRICE_EUR=5` : retour simple.
+- `LIFETIME_REENTRY_PRICE_EUR=10` : achat Lifetime.
+- `FIRST_MEDIA_REMINDER_HOURS=12` : premier rappel avant échéance.
+- `FIRST_MEDIA_FINAL_REMINDER_MINUTES=60` : dernier rappel.
+
+Au démarrage, le bot réconcilie les anciens statuts avec Telegram, contacte les membres éligibles et envoie un bilan aux `ADMIN_IDS`.
