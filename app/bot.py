@@ -290,20 +290,47 @@ async def startup_membership_audit() -> None:
                 if await get_setting(s, contact_key, "0") == "1":
                     already += 1
                     continue
-                text_msg = (
-                    "🔄 <b>Votre retour est disponible</b>\n\n"
-                    "Votre statut a été vérifié après la mise à jour du bot. "
-                    f"Vous pouvez revenir pour <b>{settings.reentry_price_eur} €</b> "
-                    f"ou choisir l’accès <b>Lifetime à {settings.lifetime_reentry_price_eur} €</b>."
-                )
                 try:
-                    await bot.send_message(
-                        user.telegram_id, text_msg,
-                        reply_markup=kb(reentry_rows(user) + [("📜 Consulter les règles", "rules:show")]),
-                    )
+                    if user.has_lifetime_reentry:
+                        # Répare automatiquement les titulaires Lifetime expulsés à tort :
+                        # déban, nouveau droit approuvé et lien personnel de retour 24 h.
+                        try:
+                            await bot.unban_chat_member(vip.telegram_chat_id, user.telegram_id, only_if_banned=True)
+                        except Exception:
+                            pass
+                        req = AccessRequest(
+                            user_id=user.id,
+                            method=AccessMethod.payment.value,
+                            status=AccessStatus.approved.value,
+                            reference=f"LFR-{user.telegram_id}-{int(datetime.now(timezone.utc).timestamp())}",
+                        )
+                        s.add(req)
+                        await s.commit()
+                        await s.refresh(req)
+                        inv = await create_personal_invite(bot, s, user, req)
+                        await bot.send_message(
+                            user.telegram_id,
+                            "♾ <b>Accès Lifetime réparé</b>\n\n"
+                            "Votre compte Lifetime avait été retiré automatiquement par erreur. "
+                            "Vous ne serez désormais plus exclu automatiquement pour inactivité. "
+                            "Les rappels restent actifs.\n\n"
+                            f"Votre nouveau lien personnel est valable {settings.invite_ttl_hours} heures :\n{inv.invite_link}",
+                        )
+                    else:
+                        text_msg = (
+                            "🔄 <b>Votre retour est disponible</b>\n\n"
+                            "Votre statut a été vérifié après la mise à jour du bot. "
+                            f"Vous pouvez revenir pour <b>{settings.reentry_price_eur} €</b> "
+                            f"ou choisir l’accès <b>Lifetime à {settings.lifetime_reentry_price_eur} €</b>."
+                        )
+                        await bot.send_message(
+                            user.telegram_id, text_msg,
+                            reply_markup=kb(reentry_rows(user) + [("📜 Consulter les règles", "rules:show")]),
+                        )
                     await set_setting(s, contact_key, "1")
                     contacted += 1
-                except Exception:
+                except Exception as exc:
+                    print("startup lifetime/reentry repair error", user.telegram_id, repr(exc))
                     failed += 1
         await s.commit()
     report = (
@@ -942,8 +969,9 @@ async def maintenance_loop():
                             try:
                                 await bot.send_message(
                                     user.telegram_id,
-                                    f"⚠️ <b>Rappel de participation</b>\n\nVous n’avez pas encore publié votre premier média valide dans le groupe VIP. "
-                                    f"Il vous reste environ <b>{remaining} heure(s)</b> avant le retrait automatique de votre accès.",
+                                    (f"⚠️ <b>Rappel de participation</b>\n\nVous n’avez pas encore publié votre premier média valide dans le groupe VIP. "
+                                     f"Il vous reste environ <b>{remaining} heure(s)</b> avant l’échéance. "
+                                     + ("Votre accès Lifetime ne sera pas retiré automatiquement, mais votre participation reste attendue." if user.has_lifetime_reentry else "Sans média, votre accès sera retiré automatiquement.")),
                                     reply_markup=kb([("📊 Voir mon statut", "member:status")]),
                                 )
                                 m.warned_first_day = True
@@ -960,26 +988,42 @@ async def maintenance_loop():
                                 try:
                                     await bot.send_message(
                                         user.telegram_id,
-                                        f"🚨 <b>Dernier rappel</b>\n\nVous n’avez toujours pas publié votre premier média. "
-                                        f"Il vous reste environ <b>{minutes} minute(s)</b> avant le retrait automatique.",
+                                        (f"🚨 <b>Dernier rappel</b>\n\nVous n’avez toujours pas publié votre premier média. "
+                                         f"Il vous reste environ <b>{minutes} minute(s)</b> avant l’échéance. "
+                                         + ("Votre protection Lifetime empêche l’exclusion automatique, mais les règles d’activité restent applicables." if user.has_lifetime_reentry else "Sans média, votre accès sera retiré automatiquement.")),
                                         reply_markup=kb([("📊 Voir mon statut", "member:status")]),
                                     )
                                     s.add(Setting(key=reminder_key, value="1"))
                                 except Exception as exc:
                                     print("final first media reminder error", user.telegram_id, repr(exc))
                         if not m.first_media_at and now >= first_deadline:
-                            try:
-                                await bot.ban_chat_member(chat.telegram_chat_id,user.telegram_id)
-                                await bot.unban_chat_member(chat.telegram_chat_id,user.telegram_id,only_if_banned=True)
-                                await bot.send_message(
-                                    user.telegram_id,
-                                    "❌ <b>Accès retiré</b>\n\nVotre accès a été retiré parce qu’aucun premier média valide n’a été publié dans le délai prévu. "
-                                    f"Vous pouvez demander à revenir avec une participation de <b>{settings.reentry_price_eur} €</b>.",
-                                    reply_markup=kb(reentry_rows(user) + [("📜 Consulter les règles", "rules:show")]),
-                                )
-                            except Exception as exc:
-                                print("first media exclusion notification error", user.telegram_id, repr(exc))
-                            m.active=False
+                            if user.has_lifetime_reentry:
+                                protection_key = f"lifetime_first_protected:{m.id}:{int(m.joined_at.timestamp())}"
+                                if await s.get(Setting, protection_key) is None:
+                                    try:
+                                        await bot.send_message(
+                                            user.telegram_id,
+                                            "♾ <b>Protection Lifetime active</b>\n\n"
+                                            "L’échéance du premier média est dépassée. Votre accès n’a pas été retiré grâce à votre formule Lifetime. "
+                                            "Merci de publier votre média dès que possible afin de respecter les règles du groupe.",
+                                            reply_markup=kb([("📊 Voir mon statut", "member:status")]),
+                                        )
+                                        s.add(Setting(key=protection_key, value="1"))
+                                    except Exception as exc:
+                                        print("lifetime first protection notification error", user.telegram_id, repr(exc))
+                            else:
+                                try:
+                                    await bot.ban_chat_member(chat.telegram_chat_id,user.telegram_id)
+                                    await bot.unban_chat_member(chat.telegram_chat_id,user.telegram_id,only_if_banned=True)
+                                    await bot.send_message(
+                                        user.telegram_id,
+                                        "❌ <b>Accès retiré</b>\n\nVotre accès a été retiré parce qu’aucun premier média valide n’a été publié dans le délai prévu. "
+                                        f"Vous pouvez demander à revenir avec une participation de <b>{settings.reentry_price_eur} €</b>.",
+                                        reply_markup=kb(reentry_rows(user) + [("📜 Consulter les règles", "rules:show")]),
+                                    )
+                                except Exception as exc:
+                                    print("first media exclusion notification error", user.telegram_id, repr(exc))
+                                m.active=False
                         elif m.first_media_at:
                             activity_deadline = m.joined_at + timedelta(hours=settings.activity_window_hours)
                             activity_reminder_at = activity_deadline - timedelta(hours=min(12, max(1, settings.activity_window_hours // 4)))
@@ -997,18 +1041,33 @@ async def maintenance_loop():
                                 except Exception as exc:
                                     print("activity reminder error", user.telegram_id, repr(exc))
                             if now >= activity_deadline and count < settings.activity_media_target:
-                                try:
-                                    await bot.ban_chat_member(chat.telegram_chat_id,user.telegram_id)
-                                    await bot.unban_chat_member(chat.telegram_chat_id,user.telegram_id,only_if_banned=True)
-                                    await bot.send_message(
-                                        user.telegram_id,
-                                        f"❌ <b>Accès retiré pour inactivité</b>\n\nSeulement <b>{count}/{settings.activity_media_target}</b> médias ont été comptabilisés. "
-                                        f"Vous pouvez demander à revenir avec une participation de <b>{settings.reentry_price_eur} €</b>.",
-                                        reply_markup=kb(reentry_rows(user) + [("📜 Consulter les règles", "rules:show")]),
-                                    )
-                                except Exception as exc:
-                                    print("activity exclusion notification error", user.telegram_id, repr(exc))
-                                m.active=False
+                                if user.has_lifetime_reentry:
+                                    protection_key = f"lifetime_activity_protected:{m.id}:{int(m.joined_at.timestamp())}"
+                                    if await s.get(Setting, protection_key) is None:
+                                        try:
+                                            await bot.send_message(
+                                                user.telegram_id,
+                                                f"♾ <b>Protection Lifetime active</b>\n\nSeulement <b>{count}/{settings.activity_media_target}</b> médias ont été comptabilisés. "
+                                                "Votre accès n’a pas été retiré automatiquement grâce à votre formule Lifetime. "
+                                                "Merci de reprendre votre participation dès que possible.",
+                                                reply_markup=kb([("📊 Voir mon statut", "member:status")]),
+                                            )
+                                            s.add(Setting(key=protection_key, value="1"))
+                                        except Exception as exc:
+                                            print("lifetime activity protection notification error", user.telegram_id, repr(exc))
+                                else:
+                                    try:
+                                        await bot.ban_chat_member(chat.telegram_chat_id,user.telegram_id)
+                                        await bot.unban_chat_member(chat.telegram_chat_id,user.telegram_id,only_if_banned=True)
+                                        await bot.send_message(
+                                            user.telegram_id,
+                                            f"❌ <b>Accès retiré pour inactivité</b>\n\nSeulement <b>{count}/{settings.activity_media_target}</b> médias ont été comptabilisés. "
+                                            f"Vous pouvez demander à revenir avec une participation de <b>{settings.reentry_price_eur} €</b>.",
+                                            reply_markup=kb(reentry_rows(user) + [("📜 Consulter les règles", "rules:show")]),
+                                        )
+                                    except Exception as exc:
+                                        print("activity exclusion notification error", user.telegram_id, repr(exc))
+                                    m.active=False
                     await s.commit()
             health_tick += 1
             if health_tick >= 5:
