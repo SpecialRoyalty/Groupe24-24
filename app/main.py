@@ -16,6 +16,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telegram-vip-bot")
 settings = get_settings()
 
+UPDATE_QUEUE: asyncio.Queue[Update] = asyncio.Queue(maxsize=1000)
+UPDATE_WORKERS: list[asyncio.Task] = []
+UPDATE_TIMEOUT_SECONDS = 60
+
 STARTUP_STATE = {
     "database": "starting",
     "webhook": "starting",
@@ -79,14 +83,49 @@ async def initialise_dependencies() -> None:
         delay = min(delay * 2, 60)
 
 
+async def process_telegram_updates(worker_id: int) -> None:
+    """Traite les mises à jour hors de la requête HTTP du webhook.
+
+    Telegram reçoit immédiatement un HTTP 200, même si un handler doit appeler
+    plusieurs fois l API Telegram ou PostgreSQL. Un handler bloqué est annulé
+    après UPDATE_TIMEOUT_SECONDS sans empêcher les mises à jour suivantes.
+    """
+    while True:
+        update = await UPDATE_QUEUE.get()
+        try:
+            await asyncio.wait_for(
+                dp.feed_update(bot, update),
+                timeout=UPDATE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Timeout pendant le traitement de la mise à jour Telegram %s (worker %s)",
+                update.update_id, worker_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Erreur pendant le traitement de la mise à jour Telegram %s (worker %s)",
+                update.update_id, worker_id,
+            )
+        finally:
+            UPDATE_QUEUE.task_done()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_task = asyncio.create_task(initialise_dependencies(), name="initialise-dependencies")
     maintenance_task = asyncio.create_task(maintenance_loop(), name="maintenance-loop")
+    workers = [
+        asyncio.create_task(process_telegram_updates(i + 1), name=f"telegram-worker-{i + 1}")
+        for i in range(4)
+    ]
+    UPDATE_WORKERS[:] = workers
     yield
-    for task in (init_task, maintenance_task):
+    for task in (init_task, maintenance_task, *workers):
         task.cancel()
-    for task in (init_task, maintenance_task):
+    for task in (init_task, maintenance_task, *workers):
         with suppress(asyncio.CancelledError):
             await task
     with suppress(Exception):
@@ -106,6 +145,8 @@ async def health():
         "service": "telegram-vip-bot",
         "database": STARTUP_STATE["database"],
         "webhook": STARTUP_STATE["webhook"],
+        "update_queue": UPDATE_QUEUE.qsize(),
+        "update_workers": sum(1 for task in UPDATE_WORKERS if not task.done()),
     }
 
 
@@ -141,18 +182,9 @@ async def telegram_webhook(
         raise HTTPException(status_code=403, detail="invalid secret")
     update = Update.model_validate(await request.json(), context={"bot": bot})
     try:
-        await dp.feed_update(bot, update)
-    except Exception as exc:
-        # Telegram réessaie les mises à jour reçues avec un code 500, ce qui peut
-        # provoquer une boucle. L'erreur est journalisée, mais le webhook reste sain.
-        logger.exception(
-            "Erreur inattendue pendant le traitement de la mise à jour Telegram %s",
-            update.update_id,
-        )
-        return {
-            "ok": False,
-            "handled": True,
-            "update_id": update.update_id,
-            "error": type(exc).__name__,
-        }
-    return {"ok": True}
+        UPDATE_QUEUE.put_nowait(update)
+    except asyncio.QueueFull:
+        # Ne jamais répondre 500 à Telegram. Le cas est journalisé et visible via /health.
+        logger.error("File Telegram saturée; mise à jour %s ignorée", update.update_id)
+        return {"ok": False, "queued": False, "reason": "queue_full"}
+    return {"ok": True, "queued": True}
