@@ -47,6 +47,13 @@ async def detected_admin_ids() -> set[int]:
         ids.update(await admin_ids_for_chat(chat.telegram_chat_id))
     return ids
 
+async def trusted_admin_ids() -> set[int]:
+    """IDs explicitement autorisés à recevoir et traiter les données sensibles."""
+    return set(settings.admin_id_set)
+
+async def is_trusted_admin(user_id: int) -> bool:
+    return user_id in settings.admin_id_set
+
 async def is_admin(user_id: int, chat_id: int | None = None) -> bool:
     if user_id in settings.admin_id_set:
         return True
@@ -56,7 +63,7 @@ async def is_admin(user_id: int, chat_id: int | None = None) -> bool:
 
 async def notify_admins(method: str, *args, **kwargs):
     """Envoie aux admins détectés ayant déjà démarré le bot; ignore les DM impossibles."""
-    for admin_id in await detected_admin_ids():
+    for admin_id in await trusted_admin_ids():
         try:
             await getattr(bot, method)(admin_id, *args, **kwargs)
         except Exception:
@@ -280,6 +287,31 @@ async def reconcile_vip_membership(session, user: User) -> Membership | None:
     return membership
 
 
+async def user_access_state(session, user: User) -> tuple[str, Membership | None]:
+    """Retourne new, active ou reentry après vérification du statut Telegram réel.
+
+    Cette vérification est appelée à chaque callback sensible afin que les anciens
+    boutons Telegram ne puissent jamais contourner le tarif de réintégration.
+    """
+    membership = await reconcile_vip_membership(session, user)
+    if membership is None:
+        return "new", None
+    if membership.active:
+        return "active", membership
+    return "reentry", membership
+
+
+async def show_reentry_required(c: CallbackQuery, user: User) -> None:
+    await c.message.edit_text(
+        "<b>🔄 Retour au groupe VIP</b>\n\n"
+        "Votre ancien accès a été retiré. Le tarif d’entrée initial ne peut plus être utilisé, "
+        "même depuis un ancien bouton Telegram.\n\n"
+        f"• Retour simple : <b>{settings.reentry_price_eur} €</b>\n"
+        f"• Lifetime : <b>{settings.lifetime_reentry_price_eur} €</b>",
+        reply_markup=kb(reentry_rows(user) + [("📜 Consulter les règles", "rules:show")]),
+    )
+
+
 @r.message(CommandStart())
 async def start(message: Message):
     if message.chat.type != "private": return
@@ -386,7 +418,16 @@ async def show_rules(c: CallbackQuery):
 @r.callback_query(F.data == "rules:accept")
 async def accept_rules(c: CallbackQuery):
     async with SessionLocal() as s:
+        user = await get_or_create_user(s, c.from_user)
+        state, _ = await user_access_state(s, user)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
+    if state == "active":
+        await c.answer("Vous êtes déjà membre actif du groupe VIP.", show_alert=True)
+        return
+    if state == "reentry":
+        await show_reentry_required(c, user)
+        await c.answer()
+        return
     text = "Choisissez votre méthode d’accès :" if enabled else "L’accès est actuellement disponible uniquement par paiement."
     await c.message.edit_text(text, reply_markup=access_methods(enabled)); await c.answer()
 
@@ -395,7 +436,15 @@ async def choose_access(c: CallbackQuery):
     method = c.data.split(":",1)[1]
     async with SessionLocal() as s:
         user = await get_or_create_user(s, c.from_user)
+        state, _ = await user_access_state(s, user)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
+        if state == "active":
+            await c.answer("Vous êtes déjà membre actif du groupe VIP.", show_alert=True)
+            return
+        if state == "reentry":
+            await show_reentry_required(c, user)
+            await c.answer("L’ancien tarif de 2 € n’est plus disponible après une exclusion.", show_alert=True)
+            return
         if method != "payment" and not enabled:
             await c.answer("Cette option est désactivée.", show_alert=True); return
         req = await create_request(s, user.id, method)
@@ -418,9 +467,19 @@ async def payment_choice(c: CallbackQuery):
     if method not in {"paypal","revolut"}: return
     details = settings.paypal_details if method == "paypal" else settings.revolut_details
     async with SessionLocal() as s:
-        user = await get_or_create_user(s, c.from_user); req = await active_request(s, user.id)
+        user = await get_or_create_user(s, c.from_user)
+        state, _ = await user_access_state(s, user)
+        req = await active_request(s, user.id)
     if not req:
         await c.answer("Aucune demande de paiement active.", show_alert=True); return
+    is_reentry_request = (req.reference or "").startswith(("RET-", "LFT-", "LFR-"))
+    if state == "active":
+        await c.answer("Vous êtes déjà membre actif du groupe VIP.", show_alert=True)
+        return
+    if state == "reentry" and not is_reentry_request:
+        await show_reentry_required(c, user)
+        await c.answer("Cet ancien paiement à 2 € n’est plus valable.", show_alert=True)
+        return
     price = settings.lifetime_reentry_price_eur if (req.reference or "").startswith("LFT-") else (settings.reentry_price_eur if (req.reference or "").startswith("RET-") else settings.entry_price_eur)
     extra = ""
     if method == "paypal":
@@ -442,8 +501,25 @@ async def private_photo(message: Message):
         await message.answer("✅ Image enregistrée.", reply_markup=kb([("⚙️ Panneau administrateur", "admin:home")]))
         return
     async with SessionLocal() as s:
-        user = await get_or_create_user(s, message.from_user); req = await active_request(s, user.id)
-        if not req: return
+        user = await get_or_create_user(s, message.from_user)
+        state, _ = await user_access_state(s, user)
+        req = await active_request(s, user.id)
+        if not req:
+            return
+        is_reentry_request = (req.reference or "").startswith(("RET-", "LFT-", "LFR-"))
+        if state == "active":
+            await message.answer("✅ Vous êtes déjà membre actif du groupe VIP. Aucun nouveau paiement n’est nécessaire.")
+            return
+        if state == "reentry" and not is_reentry_request:
+            if req.status in {AccessStatus.in_progress.value, AccessStatus.pending_review.value}:
+                req.status = AccessStatus.rejected.value
+                await s.commit()
+            await message.answer(
+                "⚠️ Cet ancien paiement d’entrée à 2 € n’est plus valable après une exclusion.\n\n"
+                f"Choisissez un retour à {settings.reentry_price_eur} € ou Lifetime à {settings.lifetime_reentry_price_eur} €.",
+                reply_markup=kb(reentry_rows(user)),
+            )
+            return
         if req.method == AccessMethod.payment.value:
             proof = PaymentProof(request_id=req.id, file_id=message.photo[-1].file_id, payment_method="manual")
             req.status = AccessStatus.pending_review.value; s.add(proof); await s.commit()
@@ -479,7 +555,7 @@ async def submit_media(c: CallbackQuery):
         files = list((await s.scalars(select(MediaSubmission).where(MediaSubmission.request_id == req_id))).all())
         if not req or req.user_id != (await get_or_create_user(s,c.from_user)).id or len(files)<5: await c.answer("Dossier incomplet",show_alert=True); return
         req.status=AccessStatus.pending_review.value; await s.commit()
-    for aid in await detected_admin_ids():
+    for aid in await trusted_admin_ids():
         try:
             await bot.send_message(aid, f"Dossier média #{req_id} — {len(files)} médias", reply_markup=kb([("✅ Accepter", f"review:media:ok:{req_id}"),("❌ Refuser", f"review:media:no:{req_id}")]))
             for f in files:
@@ -491,7 +567,9 @@ async def submit_media(c: CallbackQuery):
 
 @r.callback_query(F.data.startswith("review:"))
 async def review(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): await c.answer("Accès refusé",show_alert=True); return
+    if not await is_trusted_admin(c.from_user.id):
+        await c.answer("Validation réservée aux administrateurs autorisés", show_alert=True)
+        return
     _,kind,decision,reqid = c.data.split(":"); req_id=int(reqid)
     async with SessionLocal() as s:
         req=await s.get(AccessRequest,req_id)
@@ -1002,8 +1080,15 @@ BROADCAST_WAITING: set[int] = set()
 @r.callback_query(F.data == "menu")
 async def back_to_menu(c: CallbackQuery):
     async with SessionLocal() as s:
+        user = await get_or_create_user(s, c.from_user)
+        state, _ = await user_access_state(s, user)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
-    await c.message.edit_text("Choisissez votre méthode d’accès :" if enabled else "L’accès au groupe est actuellement disponible uniquement par paiement.", reply_markup=access_methods(enabled))
+    if state == "active":
+        await c.message.edit_text("✅ <b>Vous êtes membre actif du groupe VIP.</b>", reply_markup=kb([("📊 Voir mon activité", "member:status")]))
+    elif state == "reentry":
+        await show_reentry_required(c, user)
+    else:
+        await c.message.edit_text("Choisissez votre méthode d’accès :" if enabled else "L’accès au groupe est actuellement disponible uniquement par paiement.", reply_markup=access_methods(enabled))
     await c.answer()
 
 @r.callback_query(F.data == "rules:quit")
@@ -1027,19 +1112,19 @@ async def pending_requests_text(method: str) -> tuple[str, InlineKeyboardMarkup]
 
 @r.callback_query(F.data == "admin:payments")
 async def admin_payments(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    if not await is_trusted_admin(c.from_user.id): return await c.answer("Accès réservé", show_alert=True)
     text_, markup = await pending_requests_text(AccessMethod.payment.value)
     await c.message.edit_text(text_, reply_markup=markup); await c.answer()
 
 @r.callback_query(F.data == "admin:media_reviews")
 async def admin_media_queue(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    if not await is_trusted_admin(c.from_user.id): return await c.answer("Accès réservé", show_alert=True)
     text_, markup = await pending_requests_text(AccessMethod.media.value)
     await c.message.edit_text(text_, reply_markup=markup); await c.answer()
 
 @r.callback_query(F.data.startswith("admin:pending_pay:"))
 async def pending_pay_detail(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    if not await is_trusted_admin(c.from_user.id): return await c.answer("Accès réservé", show_alert=True)
     req_id=int(c.data.rsplit(":",1)[1])
     async with SessionLocal() as s:
         req=await s.get(AccessRequest, req_id); user=await s.get(User, req.user_id) if req else None
@@ -1051,7 +1136,7 @@ async def pending_pay_detail(c: CallbackQuery):
 
 @r.callback_query(F.data.startswith("admin:pending_media:"))
 async def pending_media_detail(c: CallbackQuery):
-    if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
+    if not await is_trusted_admin(c.from_user.id): return await c.answer("Accès réservé", show_alert=True)
     req_id=int(c.data.rsplit(":",1)[1])
     async with SessionLocal() as s:
         files=list((await s.scalars(select(MediaSubmission).where(MediaSubmission.request_id==req_id))).all())
