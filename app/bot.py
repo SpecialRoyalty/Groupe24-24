@@ -270,7 +270,10 @@ async def startup_membership_audit() -> None:
         for membership in memberships:
             checked += 1
             user = await s.get(User, membership.user_id)
-            if not user or user.is_banned:
+            # Un compte Lifetime doit être réparé même si une ancienne version
+            # l'a laissé avec users.is_banned=true. Les autres bannissements
+            # explicites restent exclus de l'audit automatique.
+            if not user or (user.is_banned and not user.has_lifetime_reentry):
                 continue
             if membership.active:
                 try:
@@ -286,18 +289,30 @@ async def startup_membership_audit() -> None:
                     continue
             if not membership.active:
                 eligible += 1
-                contact_key = f"reentry_contacted:{membership.id}"
+                # Utiliser une clé distincte pour la réparation Lifetime. Une
+                # ancienne notification de retour standard ne doit jamais empêcher
+                # le déblocage d'un titulaire Lifetime déjà expulsé.
+                contact_key = (
+                    f"lifetime_ban_repair:{user.id}:{vip.id}"
+                    if user.has_lifetime_reentry
+                    else f"reentry_contacted:{membership.id}"
+                )
                 if await get_setting(s, contact_key, "0") == "1":
                     already += 1
                     continue
                 try:
                     if user.has_lifetime_reentry:
                         # Répare automatiquement les titulaires Lifetime expulsés à tort :
-                        # déban, nouveau droit approuvé et lien personnel de retour 24 h.
-                        try:
-                            await bot.unban_chat_member(vip.telegram_chat_id, user.telegram_id, only_if_banned=True)
-                        except Exception:
-                            pass
+                        # déban, nettoyage du bannissement local, nouveau droit
+                        # approuvé et lien personnel de retour valable 24 h.
+                        await bot.unban_chat_member(
+                            vip.telegram_chat_id,
+                            user.telegram_id,
+                            only_if_banned=True,
+                        )
+                        user.is_banned = False
+                        membership.active = False
+                        await s.commit()
                         req = AccessRequest(
                             user_id=user.id,
                             method=AccessMethod.payment.value,
