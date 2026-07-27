@@ -32,6 +32,27 @@ RULES = """<b>Règles du groupe VIP</b>\n\n• Premier média dans les 24 heures
 
 ADMIN_STATUSES = {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
+
+async def safe_edit(message: Message, text: str, reply_markup=None) -> Message | None:
+    """Modifie un message texte ou sa légende, sinon envoie un nouveau message.
+
+    Telegram refuse edit_text() sur un message photo/vidéo sans texte. Cette fonction
+    centralise le choix et évite qu'un bouton casse le traitement de la mise à jour.
+    """
+    try:
+        if message.text is not None:
+            return await message.edit_text(text, reply_markup=reply_markup)
+        if message.caption is not None or message.photo or message.video or message.document or message.animation:
+            return await message.edit_caption(caption=text, reply_markup=reply_markup)
+        return await message.answer(text, reply_markup=reply_markup)
+    except TelegramBadRequest as exc:
+        error = str(exc).lower()
+        if "message is not modified" in error:
+            return None
+        if "there is no text in the message to edit" in error or "message can't be edited" in error or "message caption is not modified" in error:
+            return await message.answer(text, reply_markup=reply_markup)
+        raise
+
 async def admin_ids_for_chat(chat_id: int) -> set[int]:
     try:
         admins = await bot.get_chat_administrators(chat_id)
@@ -350,7 +371,7 @@ async def user_access_state(session, user: User) -> tuple[str, Membership | None
 
 
 async def show_reentry_required(c: CallbackQuery, user: User) -> None:
-    await c.message.edit_text(
+    await safe_edit(c.message, 
         "<b>🔄 Retour au groupe VIP</b>\n\n"
         "Votre ancien accès a été retiré. Le tarif d’entrée initial ne peut plus être utilisé, "
         "même depuis un ancien bouton Telegram.\n\n"
@@ -398,7 +419,7 @@ async def start(message: Message):
 async def reentry_start(c: CallbackQuery):
     async with SessionLocal() as s:
         user = await get_or_create_user(s, c.from_user)
-    await c.message.edit_text(
+    await safe_edit(c.message, 
         "<b>Choisissez votre formule de retour</b>\n\n"
         f"• Retour simple : <b>{settings.reentry_price_eur} €</b>\n"
         f"• Lifetime : <b>{settings.lifetime_reentry_price_eur} €</b>",
@@ -424,7 +445,7 @@ async def create_reentry_payment(c: CallbackQuery, lifetime: bool) -> None:
         await s.commit()
     price = settings.lifetime_reentry_price_eur if lifetime else settings.reentry_price_eur
     label = "Lifetime" if lifetime else "retour simple"
-    await c.message.edit_text(
+    await safe_edit(c.message, 
         f"<b>Demande de {label}</b>\n\nMontant : <b>{price} €</b>\n"
         f"Référence : <code>{req.reference}</code>\n\nChoisissez votre moyen de paiement.",
         reply_markup=payment_keyboard(),
@@ -455,13 +476,13 @@ async def reentry_lifetime_free(c: CallbackQuery):
         req.reference = f"LFR-{req.reference.removeprefix('VIP-')}"
         req.status = AccessStatus.approved.value
         await s.commit()
-    await c.message.edit_text("♾ Votre droit Lifetime est reconnu.", reply_markup=kb([("🔗 Générer mon lien 24 h", f"invite:create:{req.id}")]))
+    await safe_edit(c.message, "♾ Votre droit Lifetime est reconnu.", reply_markup=kb([("🔗 Générer mon lien 24 h", f"invite:create:{req.id}")]))
     await c.answer()
 
 
 @r.callback_query(F.data == "rules:show")
 async def show_rules(c: CallbackQuery):
-    await c.message.edit_text(RULES, reply_markup=rules_keyboard()); await c.answer()
+    await safe_edit(c.message, RULES, reply_markup=rules_keyboard()); await c.answer()
 
 @r.callback_query(F.data == "rules:accept")
 async def accept_rules(c: CallbackQuery):
@@ -477,7 +498,7 @@ async def accept_rules(c: CallbackQuery):
         await c.answer()
         return
     text = "Choisissez votre méthode d’accès :" if enabled else "L’accès est actuellement disponible uniquement par paiement."
-    await c.message.edit_text(text, reply_markup=access_methods(enabled)); await c.answer()
+    await safe_edit(c.message, text, reply_markup=access_methods(enabled)); await c.answer()
 
 @r.callback_query(F.data.startswith("access:"))
 async def choose_access(c: CallbackQuery):
@@ -497,16 +518,16 @@ async def choose_access(c: CallbackQuery):
             await c.answer("Cette option est désactivée.", show_alert=True); return
         req = await create_request(s, user.id, method)
     if method == "payment":
-        await c.message.edit_text(f"Le prix de l’accès est de <b>{settings.entry_price_eur} €</b>.\nRéférence : <code>{req.reference}</code>\n\nChoisissez le moyen de paiement.", reply_markup=payment_keyboard())
+        await safe_edit(c.message, f"Le prix de l’accès est de <b>{settings.entry_price_eur} €</b>.\nRéférence : <code>{req.reference}</code>\n\nChoisissez le moyen de paiement.", reply_markup=payment_keyboard())
     elif method == "media":
-        await c.message.edit_text("Envoyez entre 5 et 10 photos ou vidéos représentant la même personne, visage visible. Vous pouvez envoyer un album complet. Après validation, le dossier sera publié dans le groupe et comptera comme première participation.\n\nProgression : <b>0/5</b>", reply_markup=kb([("❌ Annuler", "menu")]))
+        await safe_edit(c.message, "Envoyez entre 5 et 10 photos ou vidéos représentant la même personne, visage visible. Vous pouvez envoyer un album complet. Après validation, le dossier sera publié dans le groupe et comptera comme première participation.\n\nProgression : <b>0/5</b>", reply_markup=kb([("❌ Annuler", "menu")]))
     else:
         async with SessionLocal() as s:
             pub = await pub_chat(s)
         if not pub:
-            await c.message.edit_text("Le groupe PUB n’est pas encore configuré. Contactez un administrateur."); return
+            await safe_edit(c.message, "Le groupe PUB n’est pas encore configuré. Contactez un administrateur."); return
         link = await bot.create_chat_invite_link(pub.telegram_chat_id, name=f"REF-{req.id}", expire_date=req.expires_at, member_limit=99999)
-        await c.message.edit_text(f"Votre lien personnel de parrainage :\n{link.invite_link}\n\nObjectif : <b>{settings.referral_target}</b> invitations validées en 48 heures.\nProgression : <b>0/{settings.referral_target}</b>", reply_markup=kb([("📊 Voir ma progression", f"ref:progress:{req.id}")]))
+        await safe_edit(c.message, f"Votre lien personnel de parrainage :\n{link.invite_link}\n\nObjectif : <b>{settings.referral_target}</b> invitations validées en 48 heures.\nProgression : <b>0/{settings.referral_target}</b>", reply_markup=kb([("📊 Voir ma progression", f"ref:progress:{req.id}")]))
     await c.answer()
 
 @r.callback_query(F.data.startswith("payment:"))
@@ -536,7 +557,7 @@ async def payment_choice(c: CallbackQuery):
             "Ne classez pas volontairement un achat d’accès comme un envoi personnel afin de contourner les frais ou protections. "
             "Un paiement non conforme pourra être refusé et transmis aux administrateurs pour examen."
         )
-    await c.message.edit_text(f"Envoyez exactement <b>{price} €</b>.\nMoyen : <b>{method.title()}</b>\nDestinataire : <code>{details}</code>\nRéférence obligatoire : <code>{req.reference}</code>{extra}\n\nEnvoyez ensuite la capture d’écran ici.")
+    await safe_edit(c.message, f"Envoyez exactement <b>{price} €</b>.\nMoyen : <b>{method.title()}</b>\nDestinataire : <code>{details}</code>\nRéférence obligatoire : <code>{req.reference}</code>{extra}\n\nEnvoyez ensuite la capture d’écran ici.")
     await c.answer()
 
 @r.message(F.chat.type == "private", F.photo)
@@ -611,7 +632,7 @@ async def submit_media(c: CallbackQuery):
                 else: await bot.send_video(aid,f.file_id)
         except Exception:
             pass
-    await c.message.edit_text("Votre dossier a été transmis aux modérateurs."); await c.answer()
+    await safe_edit(c.message, "Votre dossier a été transmis aux modérateurs."); await c.answer()
 
 @r.callback_query(F.data.startswith("review:"))
 async def review(c: CallbackQuery):
@@ -640,7 +661,7 @@ async def invite_create(c: CallbackQuery):
         if not req or req.user_id!=user.id or req.status!=AccessStatus.approved.value: await c.answer("Accès non autorisé",show_alert=True); return
         old=await s.scalar(select(Invite).where(Invite.user_id==user.id,Invite.revoked.is_(False),Invite.used_at.is_(None),Invite.expires_at>datetime.now(timezone.utc)))
         inv=old or await create_personal_invite(bot,s,user,req)
-    await c.message.edit_text(f"Votre lien personnel est valable 24 heures :\n{inv.invite_link}\n\nNe le partagez pas."); await c.answer()
+    await safe_edit(c.message, f"Votre lien personnel est valable 24 heures :\n{inv.invite_link}\n\nNe le partagez pas."); await c.answer()
 
 @r.chat_join_request()
 async def join_request(j: ChatJoinRequest):
@@ -733,14 +754,14 @@ async def chat_role(c: CallbackQuery):
             old=await s.scalar(select(TelegramChat).where(TelegramChat.role=="vip"));
             if old: old.role="unassigned"
         chat=await s.scalar(select(TelegramChat).where(TelegramChat.telegram_chat_id==chat_id)); chat.role=role; await s.commit()
-    await c.message.edit_text(f"Groupe configuré comme {role.upper()}."); await c.answer()
+    await safe_edit(c.message, f"Groupe configuré comme {role.upper()}."); await c.answer()
 
 async def render_admin_panel(target: Message, edit: bool = False):
     async with SessionLocal() as s:
         opt=(await get_setting(s,"alternative_access_enabled","1"))=="1"
         opened=(await get_setting(s,"group_open","1"))=="1"
     if edit:
-        await target.edit_text("<b>Panneau administrateur</b>\n\nTous les réglages sont accessibles avec les boutons ci-dessous.", reply_markup=admin_home(opt,opened))
+        await safe_edit(target, "<b>Panneau administrateur</b>\n\nTous les réglages sont accessibles avec les boutons ci-dessous.", reply_markup=admin_home(opt,opened))
     else:
         await target.answer("<b>Panneau administrateur</b>\n\nTous les réglages sont accessibles avec les boutons ci-dessous.", reply_markup=admin_home(opt,opened))
 
@@ -780,7 +801,7 @@ async def toggle_group(c: CallbackQuery):
             await set_group_open(bot, s, not current)
         except RuntimeError as exc:
             await c.answer(str(exc), show_alert=True)
-            await c.message.edit_text(
+            await safe_edit(c.message, 
                 "⚠️ <b>Action impossible</b>\n\n"
                 "Aucun groupe VIP n’est encore configuré.\n\n"
                 "Ajoutez le bot à votre groupe, donnez-lui les droits administrateur, "
@@ -790,7 +811,7 @@ async def toggle_group(c: CallbackQuery):
             return
         except Exception as exc:
             await c.answer("Impossible de modifier le groupe. Consultez Santé du système.", show_alert=True)
-            await c.message.edit_text(
+            await safe_edit(c.message, 
                 "❌ <b>Modification impossible</b>\n\n"
                 f"Telegram a refusé la modification : <code>{type(exc).__name__}</code>.\n"
                 "Vérifiez que le bot est administrateur du groupe VIP et possède le droit de modifier les permissions.",
@@ -813,7 +834,7 @@ async def admin_groups(c: CallbackQuery):
         lines.append(f"• {chat.title or chat.telegram_chat_id} — <b>{chat.role.upper()}</b> — {'actif' if chat.active else 'inactif'}")
         rows.append((f"⚙️ {chat.title[:28] or chat.telegram_chat_id}", f"admin:group:{chat.telegram_chat_id}"))
     rows.append(("⬅️ Retour", "admin:home"))
-    await c.message.edit_text("\n".join(lines) if chats else "Aucun groupe détecté.", reply_markup=kb(rows))
+    await safe_edit(c.message, "\n".join(lines) if chats else "Aucun groupe détecté.", reply_markup=kb(rows))
     await c.answer()
 
 @r.callback_query(F.data.startswith("admin:group:"))
@@ -829,7 +850,7 @@ async def admin_group_detail(c: CallbackQuery):
         [InlineKeyboardButton(text="⭐ Définir VIP",callback_data=f"chatrole:vip:{chat_id}"), InlineKeyboardButton(text="📣 Définir PUB",callback_data=f"chatrole:pub:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Retour",callback_data="admin:groups")],
     ])
-    await c.message.edit_text(f"<b>{chat.title}</b>\nID : <code>{chat.telegram_chat_id}</code>\nRôle actuel : <b>{chat.role.upper()}</b>", reply_markup=markup)
+    await safe_edit(c.message, f"<b>{chat.title}</b>\nID : <code>{chat.telegram_chat_id}</code>\nRôle actuel : <b>{chat.role.upper()}</b>", reply_markup=markup)
     await c.answer()
 
 @r.callback_query(F.data == "admin:health")
@@ -839,7 +860,7 @@ async def admin_health(c: CallbackQuery):
         return
     await c.answer("Vérification en cours…")
     report, _, _ = await build_health_report()
-    await c.message.edit_text(report, reply_markup=kb([("🔄 Relancer le diagnostic", "admin:health"), ("⬅️ Retour", "admin:home")]))
+    await safe_edit(c.message, report, reply_markup=kb([("🔄 Relancer le diagnostic", "admin:health"), ("⬅️ Retour", "admin:home")]))
 
 @r.message(Command("statut"))
 async def status(message: Message):
@@ -1005,7 +1026,7 @@ async def welcome_config_screen(c: CallbackQuery):
         text_value = await get_setting(s, "welcome_text", DEFAULT_WELCOME_TEXT)
         photo = await get_setting(s, "welcome_photo_file_id", "")
     preview = text_value[:700] + ("…" if len(text_value) > 700 else "")
-    await c.message.edit_text(
+    await safe_edit(c.message, 
         "<b>🖼 Configuration de l’accueil</b>\n\n"
         f"Image : <b>{'configurée' if photo else 'aucune'}</b>\n\n"
         f"<b>Texte actuel :</b>\n{preview}",
@@ -1027,14 +1048,14 @@ async def admin_welcome(c: CallbackQuery):
 async def admin_welcome_text(c: CallbackQuery):
     if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     ADMIN_INPUT_MODE[c.from_user.id] = "welcome_text"
-    await c.message.edit_text("Envoyez maintenant le nouveau texte d’accueil en message privé. HTML simple accepté.\n\nEnvoyez /annuler pour quitter.")
+    await safe_edit(c.message, "Envoyez maintenant le nouveau texte d’accueil en message privé. HTML simple accepté.\n\nEnvoyez /annuler pour quitter.")
     await c.answer()
 
 @r.callback_query(F.data == "admin:welcome_photo")
 async def admin_welcome_photo(c: CallbackQuery):
     if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     ADMIN_INPUT_MODE[c.from_user.id] = "welcome_photo"
-    await c.message.edit_text("Envoyez maintenant l’image d’accueil en tant que photo.\n\nEnvoyez /annuler pour quitter.")
+    await safe_edit(c.message, "Envoyez maintenant l’image d’accueil en tant que photo.\n\nEnvoyez /annuler pour quitter.")
     await c.answer()
 
 @r.callback_query(F.data == "admin:welcome_photo_remove")
@@ -1057,7 +1078,7 @@ async def pub_config_screen(c: CallbackQuery):
     async with SessionLocal() as s:
         text_value=await get_setting(s,"pub_ad_text",DEFAULT_PUB_AD_TEXT); photo=await get_setting(s,"pub_ad_photo_file_id","")
     preview=text_value[:700]+("…" if len(text_value)>700 else "")
-    await c.message.edit_text(
+    await safe_edit(c.message, 
         "<b>📣 Publicité des groupes PUB</b>\n\n"
         f"Image : <b>{'configurée' if photo else 'aucune'}</b>\n\n<b>Texte actuel :</b>\n{preview}",
         reply_markup=kb([
@@ -1079,14 +1100,14 @@ async def admin_pub_ad(c: CallbackQuery):
 async def admin_pub_text(c: CallbackQuery):
     if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     ADMIN_INPUT_MODE[c.from_user.id] = "pub_text"
-    await c.message.edit_text("Envoyez maintenant le texte de la publicité PUB.\n\nEnvoyez /annuler pour quitter.")
+    await safe_edit(c.message, "Envoyez maintenant le texte de la publicité PUB.\n\nEnvoyez /annuler pour quitter.")
     await c.answer()
 
 @r.callback_query(F.data == "admin:pub_photo")
 async def admin_pub_photo(c: CallbackQuery):
     if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     ADMIN_INPUT_MODE[c.from_user.id] = "pub_photo"
-    await c.message.edit_text("Envoyez maintenant l’image de la publicité PUB en tant que photo.\n\nEnvoyez /annuler pour quitter.")
+    await safe_edit(c.message, "Envoyez maintenant l’image de la publicité PUB en tant que photo.\n\nEnvoyez /annuler pour quitter.")
     await c.answer()
 
 @r.callback_query(F.data == "admin:pub_photo_remove")
@@ -1132,16 +1153,16 @@ async def back_to_menu(c: CallbackQuery):
         state, _ = await user_access_state(s, user)
         enabled = (await get_setting(s, "alternative_access_enabled", "1")) == "1"
     if state == "active":
-        await c.message.edit_text("✅ <b>Vous êtes membre actif du groupe VIP.</b>", reply_markup=kb([("📊 Voir mon activité", "member:status")]))
+        await safe_edit(c.message, "✅ <b>Vous êtes membre actif du groupe VIP.</b>", reply_markup=kb([("📊 Voir mon activité", "member:status")]))
     elif state == "reentry":
         await show_reentry_required(c, user)
     else:
-        await c.message.edit_text("Choisissez votre méthode d’accès :" if enabled else "L’accès au groupe est actuellement disponible uniquement par paiement.", reply_markup=access_methods(enabled))
+        await safe_edit(c.message, "Choisissez votre méthode d’accès :" if enabled else "L’accès au groupe est actuellement disponible uniquement par paiement.", reply_markup=access_methods(enabled))
     await c.answer()
 
 @r.callback_query(F.data == "rules:quit")
 async def quit_rules(c: CallbackQuery):
-    await c.message.edit_text("Vous n’avez pas accepté le règlement. Aucun accès ne peut être créé.\n\nVous pouvez revenir avec /start.")
+    await safe_edit(c.message, "Vous n’avez pas accepté le règlement. Aucun accès ne peut être créé.\n\nVous pouvez revenir avec /start.")
     await c.answer()
 
 async def pending_requests_text(method: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -1162,13 +1183,13 @@ async def pending_requests_text(method: str) -> tuple[str, InlineKeyboardMarkup]
 async def admin_payments(c: CallbackQuery):
     if not await is_trusted_admin(c.from_user.id): return await c.answer("Accès réservé", show_alert=True)
     text_, markup = await pending_requests_text(AccessMethod.payment.value)
-    await c.message.edit_text(text_, reply_markup=markup); await c.answer()
+    await safe_edit(c.message, text_, reply_markup=markup); await c.answer()
 
 @r.callback_query(F.data == "admin:media_reviews")
 async def admin_media_queue(c: CallbackQuery):
     if not await is_trusted_admin(c.from_user.id): return await c.answer("Accès réservé", show_alert=True)
     text_, markup = await pending_requests_text(AccessMethod.media.value)
-    await c.message.edit_text(text_, reply_markup=markup); await c.answer()
+    await safe_edit(c.message, text_, reply_markup=markup); await c.answer()
 
 @r.callback_query(F.data.startswith("admin:pending_pay:"))
 async def pending_pay_detail(c: CallbackQuery):
@@ -1199,7 +1220,7 @@ async def pending_media_detail(c: CallbackQuery):
 async def broadcast_start(c: CallbackQuery):
     if not await is_admin(c.from_user.id): return await c.answer("Accès refusé", show_alert=True)
     BROADCAST_WAITING.add(c.from_user.id)
-    await c.message.edit_text("<b>Broadcast</b>\n\nEnvoyez maintenant en message privé le texte à transmettre à tous les utilisateurs ayant démarré le bot.\n\nEnvoyez /annuler pour quitter.", reply_markup=kb([("⬅️ Annuler", "admin:broadcast_cancel")]))
+    await safe_edit(c.message, "<b>Broadcast</b>\n\nEnvoyez maintenant en message privé le texte à transmettre à tous les utilisateurs ayant démarré le bot.\n\nEnvoyez /annuler pour quitter.", reply_markup=kb([("⬅️ Annuler", "admin:broadcast_cancel")]))
     await c.answer()
 
 @r.callback_query(F.data == "admin:broadcast_cancel")
@@ -1247,7 +1268,7 @@ async def admin_stats(c: CallbackQuery):
         pending_pay=int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.method==AccessMethod.payment.value,AccessRequest.status==AccessStatus.pending_review.value)) or 0)
         pending_media=int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.method==AccessMethod.media.value,AccessRequest.status==AccessStatus.pending_review.value)) or 0)
         approved=int(await s.scalar(select(func.count(AccessRequest.id)).where(AccessRequest.status.in_([AccessStatus.approved.value,AccessStatus.member.value]))) or 0)
-    await c.message.edit_text(f"<b>📊 Statistiques</b>\n\nUtilisateurs enregistrés : <b>{users}</b>\nMembres VIP actifs : <b>{active}</b>\nAccès validés : <b>{approved}</b>\nPaiements à vérifier : <b>{pending_pay}</b>\nDossiers à vérifier : <b>{pending_media}</b>", reply_markup=kb([("🔄 Actualiser","admin:stats"),("⬅️ Retour","admin:home")]))
+    await safe_edit(c.message, f"<b>📊 Statistiques</b>\n\nUtilisateurs enregistrés : <b>{users}</b>\nMembres VIP actifs : <b>{active}</b>\nAccès validés : <b>{approved}</b>\nPaiements à vérifier : <b>{pending_pay}</b>\nDossiers à vérifier : <b>{pending_media}</b>", reply_markup=kb([("🔄 Actualiser","admin:stats"),("⬅️ Retour","admin:home")]))
     await c.answer()
 
 
