@@ -260,108 +260,197 @@ def reentry_rows(user: User) -> list[tuple[str, str]]:
 
 
 async def startup_membership_audit() -> None:
-    """Répare les anciens statuts et contacte une seule fois les personnes éligibles."""
+    """Répare les statuts incohérents et envoie un bilan Lifetime détaillé aux admins.
+
+    La clé de réparation est versionnée afin de retenter les comptes qui auraient
+    été ignorés par une ancienne version du correctif.
+    """
     checked = corrected = eligible = contacted = failed = already = 0
+    lifetime_checked = lifetime_absent = lifetime_repaired = lifetime_contacted = 0
+    details: list[str] = []
+
     async with SessionLocal() as s:
         vip = await vip_chat(s)
         if not vip:
+            for admin_id in settings.admin_id_set:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        "⚠️ <b>Bilan Lifetime impossible</b>\n\nAucun groupe VIP actif n'est configuré.",
+                    )
+                except Exception:
+                    pass
             return
-        memberships = list((await s.scalars(select(Membership).where(Membership.chat_id == vip.id))).all())
+
+        memberships = list((await s.scalars(
+            select(Membership).where(Membership.chat_id == vip.id)
+        )).all())
+
         for membership in memberships:
             checked += 1
             user = await s.get(User, membership.user_id)
-            # Un compte Lifetime doit être réparé même si une ancienne version
-            # l'a laissé avec users.is_banned=true. Les autres bannissements
-            # explicites restent exclus de l'audit automatique.
             if not user or (user.is_banned and not user.has_lifetime_reentry):
                 continue
-            if membership.active:
-                try:
-                    actual = await bot.get_chat_member(vip.telegram_chat_id, user.telegram_id)
-                    telegram_active = actual.status in {
-                        ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED,
-                        ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR,
-                    }
-                    if not telegram_active:
-                        membership.active = False
-                        corrected += 1
-                except Exception:
+
+            telegram_status = "inconnu"
+            telegram_active = False
+            try:
+                actual = await bot.get_chat_member(vip.telegram_chat_id, user.telegram_id)
+                telegram_status = str(actual.status)
+                telegram_active = actual.status in {
+                    ChatMemberStatus.MEMBER,
+                    ChatMemberStatus.RESTRICTED,
+                    ChatMemberStatus.ADMINISTRATOR,
+                    ChatMemberStatus.CREATOR,
+                }
+            except Exception as exc:
+                telegram_status = f"erreur:{type(exc).__name__}"
+
+            if membership.active and not telegram_active and not telegram_status.startswith("erreur:"):
+                membership.active = False
+                corrected += 1
+
+            if user.has_lifetime_reentry:
+                lifetime_checked += 1
+                display_name = " ".join(x for x in (user.first_name, user.last_name) if x).strip() or "Sans nom"
+                username = f"@{user.username}" if user.username else "sans username"
+
+                if telegram_active:
+                    details.append(
+                        f"✅ {display_name} — {username} — <code>{user.telegram_id}</code> : déjà présent ({telegram_status})"
+                    )
                     continue
-            if not membership.active:
+
+                lifetime_absent += 1
                 eligible += 1
-                # Utiliser une clé distincte pour la réparation Lifetime. Une
-                # ancienne notification de retour standard ne doit jamais empêcher
-                # le déblocage d'un titulaire Lifetime déjà expulsé.
-                contact_key = (
-                    f"lifetime_ban_repair:{user.id}:{vip.id}"
-                    if user.has_lifetime_reentry
-                    else f"reentry_contacted:{membership.id}"
-                )
-                if await get_setting(s, contact_key, "0") == "1":
+                repair_key = f"lifetime_ban_repair_v2:{user.id}:{vip.id}"
+                was_done = await get_setting(s, repair_key, "0") == "1"
+                if was_done:
                     already += 1
+                    details.append(
+                        f"ℹ️ {display_name} — {username} — <code>{user.telegram_id}</code> : correctif déjà exécuté, statut Telegram {telegram_status}"
+                    )
                     continue
+
+                unban_result = "non nécessaire"
+                invite_result = "non généré"
+                message_result = "non envoyé"
                 try:
-                    if user.has_lifetime_reentry:
-                        # Répare automatiquement les titulaires Lifetime expulsés à tort :
-                        # déban, nettoyage du bannissement local, nouveau droit
-                        # approuvé et lien personnel de retour valable 24 h.
+                    try:
                         await bot.unban_chat_member(
                             vip.telegram_chat_id,
                             user.telegram_id,
                             only_if_banned=True,
                         )
-                        user.is_banned = False
-                        membership.active = False
-                        await s.commit()
-                        req = AccessRequest(
-                            user_id=user.id,
-                            method=AccessMethod.payment.value,
-                            status=AccessStatus.approved.value,
-                            reference=f"LFR-{user.telegram_id}-{int(datetime.now(timezone.utc).timestamp())}",
-                        )
-                        s.add(req)
-                        await s.commit()
-                        await s.refresh(req)
-                        inv = await create_personal_invite(bot, s, user, req)
-                        await bot.send_message(
-                            user.telegram_id,
-                            "♾ <b>Accès Lifetime réparé</b>\n\n"
-                            "Votre compte Lifetime avait été retiré automatiquement par erreur. "
-                            "Vous ne serez désormais plus exclu automatiquement pour inactivité. "
-                            "Les rappels restent actifs.\n\n"
-                            f"Votre nouveau lien personnel est valable {settings.invite_ttl_hours} heures :\n{inv.invite_link}",
-                        )
-                    else:
-                        text_msg = (
-                            "🔄 <b>Votre retour est disponible</b>\n\n"
-                            "Votre statut a été vérifié après la mise à jour du bot. "
-                            f"Vous pouvez revenir pour <b>{settings.reentry_price_eur} €</b> "
-                            f"ou choisir l’accès <b>Lifetime à {settings.lifetime_reentry_price_eur} €</b>."
-                        )
-                        await bot.send_message(
-                            user.telegram_id, text_msg,
-                            reply_markup=kb(reentry_rows(user) + [("📜 Consulter les règles", "rules:show")]),
-                        )
+                        unban_result = "réussi"
+                    except Exception as exc:
+                        # Un compte simplement sorti n'est pas forcément banni.
+                        unban_result = f"{type(exc).__name__}"
+
+                    user.is_banned = False
+                    membership.active = False
+                    await s.commit()
+
+                    req = AccessRequest(
+                        user_id=user.id,
+                        method=AccessMethod.payment.value,
+                        status=AccessStatus.approved.value,
+                        reference=f"LFR2-{user.telegram_id}-{int(datetime.now(timezone.utc).timestamp())}",
+                    )
+                    s.add(req)
+                    await s.commit()
+                    await s.refresh(req)
+                    inv = await create_personal_invite(bot, s, user, req)
+                    invite_result = "généré"
+                    lifetime_repaired += 1
+
+                    await bot.send_message(
+                        user.telegram_id,
+                        "♾ <b>Accès Lifetime réactivé</b>\n\n"
+                        "Votre accès Lifetime avait été retiré automatiquement par erreur. "
+                        "Le correctif est maintenant appliqué : vous recevrez toujours les rappels, "
+                        "mais vous ne serez plus exclu automatiquement pour inactivité.\n\n"
+                        f"Votre nouveau lien personnel est valable {settings.invite_ttl_hours} heures :\n{inv.invite_link}",
+                    )
+                    message_result = "envoyé"
+                    lifetime_contacted += 1
+                    contacted += 1
+                    await set_setting(s, repair_key, "1")
+
+                    details.append(
+                        f"✅ {display_name} — {username} — <code>{user.telegram_id}</code> : "
+                        f"statut {telegram_status}, déban {unban_result}, lien {invite_result}, message {message_result}"
+                    )
+                except Exception as exc:
+                    failed += 1
+                    details.append(
+                        f"❌ {display_name} — {username} — <code>{user.telegram_id}</code> : "
+                        f"statut {telegram_status}, déban {unban_result}, lien {invite_result}, "
+                        f"message {message_result}, erreur {type(exc).__name__}: {str(exc)[:180]}"
+                    )
+                    print("startup lifetime repair error", user.telegram_id, repr(exc))
+                continue
+
+            if not membership.active:
+                eligible += 1
+                contact_key = f"reentry_contacted:{membership.id}"
+                if await get_setting(s, contact_key, "0") == "1":
+                    already += 1
+                    continue
+                try:
+                    text_msg = (
+                        "🔄 <b>Votre retour est disponible</b>\n\n"
+                        "Votre statut a été vérifié après la mise à jour du bot. "
+                        f"Vous pouvez revenir pour <b>{settings.reentry_price_eur} €</b> "
+                        f"ou choisir l’accès <b>Lifetime à {settings.lifetime_reentry_price_eur} €</b>."
+                    )
+                    await bot.send_message(
+                        user.telegram_id,
+                        text_msg,
+                        reply_markup=kb(reentry_rows(user) + [("📜 Consulter les règles", "rules:show")]),
+                    )
                     await set_setting(s, contact_key, "1")
                     contacted += 1
                 except Exception as exc:
-                    print("startup lifetime/reentry repair error", user.telegram_id, repr(exc))
+                    print("startup reentry contact error", user.telegram_id, repr(exc))
                     failed += 1
+
         await s.commit()
-    report = (
+
+    summary = (
         "🧰 <b>Bilan de réparation au démarrage</b>\n\n"
         f"Membres vérifiés : <b>{checked}</b>\n"
-        f"Statuts corrigés : <b>{corrected}</b>\n"
-        f"Personnes éligibles : <b>{eligible}</b>\n"
-        f"Personnes contactées : <b>{contacted}</b>\n"
-        f"Déjà contactées : <b>{already}</b>\n"
-        f"Contacts impossibles : <b>{failed}</b>"
+        f"Statuts locaux corrigés : <b>{corrected}</b>\n"
+        f"Comptes Lifetime vérifiés : <b>{lifetime_checked}</b>\n"
+        f"Lifetime absents/bannis détectés : <b>{lifetime_absent}</b>\n"
+        f"Lifetime réparés avec lien : <b>{lifetime_repaired}</b>\n"
+        f"Messages Lifetime envoyés : <b>{lifetime_contacted}</b>\n"
+        f"Déjà traités par ce correctif : <b>{already}</b>\n"
+        f"Échecs : <b>{failed}</b>"
     )
+
+    # Telegram limite un message à 4096 caractères. Le résumé est envoyé en
+    # premier, puis la liste détaillée en plusieurs blocs.
+    detail_chunks: list[str] = []
+    if details:
+        current = "👥 <b>Détail des comptes Lifetime</b>\n\n"
+        for line in details:
+            addition = line + "\n"
+            if len(current) + len(addition) > 3900:
+                detail_chunks.append(current.rstrip())
+                current = "👥 <b>Suite du bilan Lifetime</b>\n\n" + addition
+            else:
+                current += addition
+        if current.strip():
+            detail_chunks.append(current.rstrip())
+
     for admin_id in settings.admin_id_set:
         try:
-            await bot.send_message(admin_id, report)
-        except Exception:
-            pass
+            await bot.send_message(admin_id, summary)
+            for chunk in detail_chunks:
+                await bot.send_message(admin_id, chunk)
+        except Exception as exc:
+            print("admin lifetime report error", admin_id, repr(exc))
 
 
 async def reconcile_vip_membership(session, user: User) -> Membership | None:
