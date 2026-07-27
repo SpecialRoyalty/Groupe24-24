@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, ChatJoinRequest, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select, func, text
@@ -71,9 +72,14 @@ async def notify_admins(method: str, *args, **kwargs):
 
 
 async def build_health_report() -> tuple[str, list[str], str]:
-    """Vérifie la base, Telegram, le webhook et les groupes obligatoires."""
+    """Vérifie la base, Telegram, le webhook et les groupes obligatoires.
+
+    Les groupes PUB définitivement inaccessibles sont désactivés automatiquement.
+    Une panne d'un seul groupe PUB ne doit jamais rendre le bot entier CRITIQUE.
+    """
     checks: list[str] = []
     alerts: list[str] = []
+    critical_alerts: list[str] = []
 
     # Base de données
     try:
@@ -83,8 +89,10 @@ async def build_health_report() -> tuple[str, list[str], str]:
         checks.append("✅ Base PostgreSQL accessible")
     except Exception as exc:
         chats = []
+        message = f"Base de données : {type(exc).__name__}"
         checks.append("❌ Base PostgreSQL inaccessible")
-        alerts.append(f"Base de données : {type(exc).__name__}")
+        alerts.append(message)
+        critical_alerts.append(message)
 
     # Identité du bot et webhook
     bot_id: int | None = None
@@ -93,8 +101,10 @@ async def build_health_report() -> tuple[str, list[str], str]:
         bot_id = me.id
         checks.append(f"✅ Bot Telegram connecté : @{me.username or me.id}")
     except Exception as exc:
+        message = f"Connexion Telegram : {type(exc).__name__}"
         checks.append("❌ Connexion Telegram impossible")
-        alerts.append(f"Telegram : {type(exc).__name__}")
+        alerts.append(message)
+        critical_alerts.append(message)
 
     try:
         webhook = await bot.get_webhook_info()
@@ -103,28 +113,37 @@ async def build_health_report() -> tuple[str, list[str], str]:
             if webhook.last_error_message:
                 checks.append("ℹ️ Telegram conserve une ancienne erreur de livraison (information seulement)")
         else:
+            message = "URL du webhook différente de PUBLIC_BASE_URL"
             checks.append("❌ URL du webhook incorrecte")
-            alerts.append("URL du webhook différente de PUBLIC_BASE_URL")
+            alerts.append(message)
+            critical_alerts.append(message)
         if webhook.pending_update_count:
             checks.append(f"⚠️ {webhook.pending_update_count} mise(s) à jour Telegram en attente")
     except Exception as exc:
+        message = f"Webhook : {type(exc).__name__}"
         checks.append("❌ Impossible de lire l’état du webhook")
-        alerts.append(f"Webhook : {type(exc).__name__}")
+        alerts.append(message)
+        critical_alerts.append(message)
 
     vip = [c for c in chats if c.role == "vip"]
     pubs = [c for c in chats if c.role == "pub"]
     if vip:
         checks.append(f"✅ Groupe VIP configuré : {vip[0].title or vip[0].telegram_chat_id}")
     else:
+        message = "Aucun groupe VIP actif"
         checks.append("❌ Aucun groupe VIP actif")
-        alerts.append("Aucun groupe VIP actif")
+        alerts.append(message)
+        critical_alerts.append(message)
+
     if pubs:
         checks.append(f"✅ Groupe(s) PUB actif(s) : {len(pubs)}")
     else:
         checks.append("❌ Aucun groupe PUB actif")
         alerts.append("Aucun groupe PUB actif")
 
-    # Présence et permissions du bot dans chaque groupe essentiel
+    # Présence et permissions du bot dans chaque groupe essentiel.
+    # Un ancien groupe PUB supprimé/retiré est désactivé au lieu de bloquer le bot.
+    stale_pub_ids: list[int] = []
     if bot_id:
         for chat in vip + pubs:
             label = f"{chat.role.upper()} — {chat.title or chat.telegram_chat_id}"
@@ -132,39 +151,68 @@ async def build_health_report() -> tuple[str, list[str], str]:
                 member = await bot.get_chat_member(chat.telegram_chat_id, bot_id)
                 if member.status not in ADMIN_STATUSES:
                     checks.append(f"❌ {label} : bot non administrateur")
-                    alerts.append(f"{label} : droits administrateur manquants")
+                    message = f"{label} : droits administrateur manquants"
+                    alerts.append(message)
+                    if chat.role == "vip":
+                        critical_alerts.append(message)
                     continue
                 missing: list[str] = []
                 if chat.role == "vip":
                     for attr, title in (("can_delete_messages", "supprimer"), ("can_restrict_members", "restreindre/bannir"), ("can_invite_users", "inviter")):
                         if not getattr(member, attr, False):
                             missing.append(title)
-                else:
-                    if not getattr(member, "can_invite_users", False):
-                        missing.append("inviter")
+                elif not getattr(member, "can_invite_users", False):
+                    missing.append("inviter")
                 if missing:
                     checks.append(f"⚠️ {label} : droits manquants ({', '.join(missing)})")
-                    alerts.append(f"{label} : droits manquants ({', '.join(missing)})")
+                    message = f"{label} : droits manquants ({', '.join(missing)})"
+                    alerts.append(message)
+                    if chat.role == "vip":
+                        critical_alerts.append(message)
                 else:
                     checks.append(f"✅ {label} : bot administrateur et droits essentiels OK")
+            except (TelegramForbiddenError, TelegramBadRequest) as exc:
+                if chat.role == "pub":
+                    stale_pub_ids.append(chat.id)
+                    checks.append(f"ℹ️ {label} : ancien groupe inaccessible, désactivé automatiquement")
+                else:
+                    message = f"{label} inaccessible : {type(exc).__name__}"
+                    checks.append(f"❌ {label} : groupe inaccessible")
+                    alerts.append(message)
+                    critical_alerts.append(message)
             except Exception as exc:
-                checks.append(f"❌ {label} : groupe inaccessible")
-                alerts.append(f"{label} inaccessible : {type(exc).__name__}")
+                message = f"{label} inaccessible : {type(exc).__name__}"
+                checks.append(f"⚠️ {label} : vérification impossible")
+                alerts.append(message)
+                if chat.role == "vip":
+                    critical_alerts.append(message)
+
+    if stale_pub_ids:
+        try:
+            async with SessionLocal() as s:
+                stale_rows = list((await s.scalars(select(TelegramChat).where(TelegramChat.id.in_(stale_pub_ids)))).all())
+                for row in stale_rows:
+                    row.active = False
+                await s.commit()
+        except Exception as exc:
+            alerts.append(f"Nettoyage des groupes PUB obsolètes : {type(exc).__name__}")
 
     if LAST_MAINTENANCE_AT:
         age = datetime.now(timezone.utc) - LAST_MAINTENANCE_AT
         if age <= timedelta(minutes=3):
             checks.append("✅ Tâche automatique active")
         else:
+            message = "La boucle de maintenance ne répond plus normalement"
             checks.append("❌ Tâche automatique en retard")
-            alerts.append("La boucle de maintenance ne répond plus normalement")
+            alerts.append(message)
+            critical_alerts.append(message)
     else:
         checks.append("⚠️ Tâche automatique pas encore confirmée")
     if LAST_MAINTENANCE_ERROR:
         checks.append("⚠️ Une erreur récente de maintenance est enregistrée")
         alerts.append(f"Maintenance : {LAST_MAINTENANCE_ERROR[:180]}")
 
-    status = "OK" if not alerts else ("CRITIQUE" if any(a.startswith("Aucun groupe VIP") or "Base de données" in a or "Telegram" in a for a in alerts) else "ATTENTION")
+    status = "CRITIQUE" if critical_alerts else ("ATTENTION" if alerts else "OK")
     text_report = f"<b>🩺 Santé du système — {status}</b>\n\n" + "\n".join(checks)
     if alerts:
         text_report += "\n\n<b>Alertes</b>\n• " + "\n• ".join(alerts[:12])
